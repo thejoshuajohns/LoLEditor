@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "league-video-editor"
+version = "0.1.0"
+description = "Automated League of Legends video editor for OBS recordings"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "LeagueOfLegendsEditor" }
+]
+dependencies = []
+
+[project.scripts]
+lol-video-editor = "league_video_editor.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
