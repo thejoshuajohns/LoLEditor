@@ -9,6 +9,8 @@ from unittest.mock import patch
 from league_video_editor.cli import (
     EditorError,
     Segment,
+    _looks_like_loudnorm_nonfinite_error,
+    _probe_duration_seconds,
     _validate_cli_options,
     build_segments,
     detect_scene_events,
@@ -85,6 +87,26 @@ class SegmentLogicTests(unittest.TestCase):
             with self.assertRaisesRegex(EditorError, "Segment at index 0"):
                 read_plan(plan_path)
 
+    def test_read_plan_rejects_non_finite_segment_values(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            plan_path = Path(temp_dir) / "plan.json"
+            plan_path.write_text(
+                json.dumps({"segments": [{"start": float("nan"), "end": 10.0}]}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(EditorError, "non-finite"):
+                read_plan(plan_path)
+
+    def test_read_plan_rejects_non_positive_duration_segment(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            plan_path = Path(temp_dir) / "plan.json"
+            plan_path.write_text(
+                json.dumps({"segments": [{"start": 10.0, "end": 10.0}]}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(EditorError, "end > start"):
+                read_plan(plan_path)
+
     def test_write_plan_rejects_non_finite_values(self) -> None:
         with TemporaryDirectory() as temp_dir:
             plan_path = Path(temp_dir) / "plan.json"
@@ -104,6 +126,26 @@ class SegmentLogicTests(unittest.TestCase):
                         "max_clips": 20,
                     },
                 )
+
+    def test_probe_duration_rejects_non_numeric_output(self) -> None:
+        with patch(
+            "league_video_editor.cli._run_command",
+            return_value=subprocess.CompletedProcess(
+                args=["ffprobe"], returncode=0, stdout="N/A\n", stderr=""
+            ),
+        ):
+            with self.assertRaisesRegex(EditorError, "Could not parse duration"):
+                _probe_duration_seconds(Path("input.mp4"))
+
+    def test_probe_duration_rejects_non_finite_output(self) -> None:
+        with patch(
+            "league_video_editor.cli._run_command",
+            return_value=subprocess.CompletedProcess(
+                args=["ffprobe"], returncode=0, stdout="inf\n", stderr=""
+            ),
+        ):
+            with self.assertRaisesRegex(EditorError, "valid finite value"):
+                _probe_duration_seconds(Path("input.mp4"))
 
     def test_validate_cli_options_rejects_non_finite_scene_threshold(self) -> None:
         args = argparse.Namespace(
@@ -249,6 +291,22 @@ class SegmentLogicTests(unittest.TestCase):
             self.assertIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(first_command))
             self.assertNotIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(second_command))
             self.assertIn("-c:a", second_command)
+
+    def test_loudnorm_error_matcher_accepts_variant_message(self) -> None:
+        error = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["ffmpeg"],
+            stderr="... Input contains NaN and +Inf samples ...",
+        )
+        self.assertTrue(_looks_like_loudnorm_nonfinite_error(error))
+
+    def test_loudnorm_error_matcher_rejects_unrelated_error(self) -> None:
+        error = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["ffmpeg"],
+            stderr="Error while decoding stream #0:0",
+        )
+        self.assertFalse(_looks_like_loudnorm_nonfinite_error(error))
 
     def test_detect_scene_events_propagates_command_failures(self) -> None:
         with patch(
