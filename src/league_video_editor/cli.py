@@ -15,6 +15,8 @@ from pathlib import Path
 SCENE_PTS_PATTERN = re.compile(r"pts_time:(-?\d+(?:\.\d+)?)")
 LOUDNORM_FILTER = "loudnorm=I=-14:LRA=11:TP=-1.5"
 LOUDNORM_NONFINITE_PATTERN = re.compile(r"input contains.*nan.*inf", re.IGNORECASE | re.DOTALL)
+LOUDNORM_ANALYSIS_FILTER = f"{LOUDNORM_FILTER}:print_format=json"
+VIDEO_ENCODERS = ("libx264", "h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf")
 
 
 class EditorError(RuntimeError):
@@ -45,6 +47,66 @@ def _run_command(cmd: list[str], *, capture_output: bool = False) -> subprocess.
         text=True,
         capture_output=capture_output,
     )
+
+
+def _video_postprocess_filter(*, allow_upscale: bool) -> str:
+    if allow_upscale:
+        scale = "scale=w=1920:h=1080:force_original_aspect_ratio=decrease"
+    else:
+        scale = (
+            "scale="
+            "w='if(gt(iw,1920),1920,iw)':"
+            "h='if(gt(ih,1080),1080,ih)':"
+            "force_original_aspect_ratio=decrease"
+        )
+    return (
+        f"{scale},"
+        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,"
+        "fps=60,"
+        "format=yuv420p"
+    )
+
+
+def _video_codec_args(*, video_encoder: str, crf: int, preset: str) -> list[str]:
+    if video_encoder == "libx264":
+        return [
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            "yuv420p",
+        ]
+    return [
+        "-c:v",
+        video_encoder,
+        "-b:v",
+        "10M",
+        "-maxrate",
+        "12M",
+        "-bufsize",
+        "20M",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+
+
+def _effective_transition_duration(
+    requested: float,
+    *,
+    left_duration: float,
+    right_duration: float,
+) -> float:
+    if requested <= 0:
+        return 0.0
+    max_duration = min(left_duration, right_duration) - 0.001
+    if max_duration <= 0:
+        raise EditorError(
+            "Crossfade requires segment durations greater than 0.001 seconds."
+        )
+    return min(requested, max_duration)
 
 
 def _probe_duration_seconds(input_path: Path) -> float:
@@ -276,40 +338,100 @@ def _build_filter_complex(
     segments: list[Segment],
     include_audio: bool,
     *,
-    normalize_audio: bool = True,
-) -> tuple[str, str, str | None]:
+    include_video: bool = True,
+    allow_upscale: bool = False,
+    crossfade_seconds: float = 0.0,
+    audio_fade_seconds: float = 0.03,
+    audio_post_filter: str | None = None,
+) -> tuple[str, str | None, str | None]:
     pieces: list[str] = []
-    for index, segment in enumerate(segments):
-        pieces.append(
-            f"[0:v]trim=start={segment.start:.3f}:end={segment.end:.3f},setpts=PTS-STARTPTS[v{index}]"
-        )
-        if include_audio:
+    durations = [segment.duration for segment in segments]
+
+    video_output_label: str | None = None
+    if include_video:
+        for index, segment in enumerate(segments):
             pieces.append(
-                f"[0:a]atrim=start={segment.start:.3f}:end={segment.end:.3f},asetpts=PTS-STARTPTS[a{index}]"
+                f"[0:v]trim=start={segment.start:.3f}:end={segment.end:.3f},setpts=PTS-STARTPTS[v{index}]"
             )
 
-    if include_audio:
-        concat_inputs = "".join(f"[v{index}][a{index}]" for index in range(len(segments)))
-        pieces.append(
-            f"{concat_inputs}concat=n={len(segments)}:v=1:a=1[vcat][acat]"
-        )
-        pieces.append(
-            "[vcat]scale=w=1920:h=1080:force_original_aspect_ratio=decrease,"
-            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,fps=60,format=yuv420p[vout]"
-        )
-        if normalize_audio:
-            pieces.append(f"[acat]{LOUDNORM_FILTER}[aout]")
+        if crossfade_seconds > 0 and len(segments) > 1:
+            running_duration = durations[0]
+            current_label = "v0"
+            for index in range(1, len(segments)):
+                transition_duration = _effective_transition_duration(
+                    crossfade_seconds,
+                    left_duration=running_duration,
+                    right_duration=durations[index],
+                )
+                offset = max(0.0, running_duration - transition_duration)
+                next_label = f"vxf{index}"
+                pieces.append(
+                    f"[{current_label}][v{index}]"
+                    f"xfade=transition=fade:duration={transition_duration:.3f}:offset={offset:.3f}"
+                    f"[{next_label}]"
+                )
+                current_label = next_label
+                running_duration = running_duration + durations[index] - transition_duration
+            video_source = current_label
         else:
-            pieces.append("[acat]anull[aout]")
-        return ";".join(pieces), "[vout]", "[aout]"
+            concat_inputs = "".join(f"[v{index}]" for index in range(len(segments)))
+            pieces.append(f"{concat_inputs}concat=n={len(segments)}:v=1:a=0[vcat]")
+            video_source = "vcat"
 
-    concat_inputs = "".join(f"[v{index}]" for index in range(len(segments)))
-    pieces.append(f"{concat_inputs}concat=n={len(segments)}:v=1:a=0[vcat]")
-    pieces.append(
-        "[vcat]scale=w=1920:h=1080:force_original_aspect_ratio=decrease,"
-        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,fps=60,format=yuv420p[vout]"
-    )
-    return ";".join(pieces), "[vout]", None
+        pieces.append(
+            f"[{video_source}]"
+            f"{_video_postprocess_filter(allow_upscale=allow_upscale)}"
+            "[vout]"
+        )
+        video_output_label = "[vout]"
+
+    audio_output_label: str | None = None
+    if include_audio:
+        for index, segment in enumerate(segments):
+            audio_steps = [
+                f"atrim=start={segment.start:.3f}:end={segment.end:.3f}",
+                "asetpts=PTS-STARTPTS",
+            ]
+            if audio_fade_seconds > 0:
+                fade_duration = min(audio_fade_seconds, segment.duration / 2)
+                if fade_duration > 0:
+                    fade_out_start = max(0.0, segment.duration - fade_duration)
+                    audio_steps.extend(
+                        [
+                            f"afade=t=in:st=0:d={fade_duration:.3f}",
+                            f"afade=t=out:st={fade_out_start:.3f}:d={fade_duration:.3f}",
+                        ]
+                    )
+            pieces.append(f"[0:a]{','.join(audio_steps)}[a{index}]")
+
+        if crossfade_seconds > 0 and len(segments) > 1:
+            running_duration = durations[0]
+            current_label = "a0"
+            for index in range(1, len(segments)):
+                transition_duration = _effective_transition_duration(
+                    crossfade_seconds,
+                    left_duration=running_duration,
+                    right_duration=durations[index],
+                )
+                next_label = f"axf{index}"
+                pieces.append(
+                    f"[{current_label}][a{index}]"
+                    f"acrossfade=d={transition_duration:.3f}:c1=tri:c2=tri"
+                    f"[{next_label}]"
+                )
+                current_label = next_label
+                running_duration = running_duration + durations[index] - transition_duration
+            audio_source = current_label
+        else:
+            concat_inputs = "".join(f"[a{index}]" for index in range(len(segments)))
+            pieces.append(f"{concat_inputs}concat=n={len(segments)}:v=0:a=1[acat]")
+            audio_source = "acat"
+
+        post_filter = audio_post_filter or "anull"
+        pieces.append(f"[{audio_source}]{post_filter}[aout]")
+        audio_output_label = "[aout]"
+
+    return ";".join(pieces), video_output_label, audio_output_label
 
 
 def _looks_like_loudnorm_nonfinite_error(error: subprocess.CalledProcessError) -> bool:
@@ -317,6 +439,70 @@ def _looks_like_loudnorm_nonfinite_error(error: subprocess.CalledProcessError) -
     stdout = error.stdout or ""
     combined_output = f"{stderr}\n{stdout}"
     return bool(LOUDNORM_NONFINITE_PATTERN.search(combined_output))
+
+
+def _extract_loudnorm_json(analysis_output: str) -> dict[str, float]:
+    start = analysis_output.rfind("{")
+    end = analysis_output.rfind("}")
+    if start < 0 or end <= start:
+        raise EditorError("Could not parse loudnorm analysis output.")
+
+    try:
+        payload = json.loads(analysis_output[start : end + 1])
+    except json.JSONDecodeError as error:
+        raise EditorError("Could not decode loudnorm analysis JSON.") from error
+
+    extracted: dict[str, float] = {}
+    required = {
+        "input_i": "measured_I",
+        "input_tp": "measured_TP",
+        "input_lra": "measured_LRA",
+        "input_thresh": "measured_thresh",
+        "target_offset": "offset",
+    }
+    for source_key, output_key in required.items():
+        if source_key not in payload:
+            raise EditorError(f"Missing '{source_key}' in loudnorm analysis output.")
+        try:
+            value = float(payload[source_key])
+        except (TypeError, ValueError) as error:
+            raise EditorError(f"Invalid '{source_key}' in loudnorm analysis output.") from error
+        if not math.isfinite(value):
+            raise EditorError(f"Non-finite '{source_key}' in loudnorm analysis output.")
+        extracted[output_key] = value
+    return extracted
+
+
+def _build_two_pass_loudnorm_filter(analysis_command: list[str]) -> str:
+    result = _run_command(analysis_command, capture_output=True)
+    analysis_output = (result.stderr or "") + "\n" + (result.stdout or "")
+    metrics = _extract_loudnorm_json(analysis_output)
+    return (
+        "loudnorm=I=-14:LRA=11:TP=-1.5:"
+        f"measured_I={metrics['measured_I']:.3f}:"
+        f"measured_TP={metrics['measured_TP']:.3f}:"
+        f"measured_LRA={metrics['measured_LRA']:.3f}:"
+        f"measured_thresh={metrics['measured_thresh']:.3f}:"
+        f"offset={metrics['offset']:.3f}:"
+        "linear=true:print_format=summary"
+    )
+
+
+def _select_loudnorm_filter(
+    *,
+    two_pass_loudnorm: bool,
+    analysis_command: list[str] | None,
+) -> str:
+    if not two_pass_loudnorm or analysis_command is None:
+        return LOUDNORM_FILTER
+    try:
+        return _build_two_pass_loudnorm_filter(analysis_command)
+    except (EditorError, subprocess.CalledProcessError) as error:
+        print(
+            f"Warning: two-pass loudnorm analysis failed ({error}); using one-pass loudnorm.",
+            file=sys.stderr,
+        )
+        return LOUDNORM_FILTER
 
 
 def _run_with_loudnorm_fallback(
@@ -346,6 +532,11 @@ def render_highlights(
     output_path: Path,
     crf: int,
     preset: str,
+    video_encoder: str,
+    allow_upscale: bool,
+    crossfade_seconds: float,
+    audio_fade_seconds: float,
+    two_pass_loudnorm: bool,
 ) -> None:
     segments = read_plan(plan_path)
     if not segments:
@@ -354,102 +545,144 @@ def render_highlights(
         )
 
     include_audio = _has_audio_stream(input_path)
-    filter_graph, map_video, map_audio = _build_filter_complex(
-        segments,
-        include_audio,
-        normalize_audio=True,
-    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
-        "-i",
-        str(input_path),
-        "-filter_complex",
-        filter_graph,
-        "-map",
-        map_video,
-        "-c:v",
-        "libx264",
-        "-preset",
-        preset,
-        "-crf",
-        str(crf),
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-    ]
-    if map_audio is not None:
-        command.extend(
-            [
-                "-map",
-                map_audio,
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-ac",
-                "2",
-                "-ar",
-                "48000",
-            ]
-        )
-    else:
-        command.append("-an")
-
-    command.append(str(output_path))
-
-    fallback_command: list[str] | None = None
-    if include_audio:
-        fallback_filter_graph, fallback_map_video, fallback_map_audio = _build_filter_complex(
+    if not include_audio:
+        filter_graph, map_video, map_audio = _build_filter_complex(
             segments,
-            include_audio=True,
-            normalize_audio=False,
+            include_audio=False,
+            include_video=True,
+            allow_upscale=allow_upscale,
+            crossfade_seconds=crossfade_seconds,
+            audio_fade_seconds=audio_fade_seconds,
         )
-        fallback_command = [
+        if map_video is None:
+            raise EditorError("Failed to build video filter graph.")
+        command = [
             "ffmpeg",
             "-hide_banner",
             "-y",
             "-i",
             str(input_path),
             "-filter_complex",
-            fallback_filter_graph,
+            filter_graph,
             "-map",
-            fallback_map_video,
-            "-c:v",
-            "libx264",
-            "-preset",
-            preset,
-            "-crf",
-            str(crf),
-            "-pix_fmt",
-            "yuv420p",
+            map_video,
+            *_video_codec_args(video_encoder=video_encoder, crf=crf, preset=preset),
             "-movflags",
             "+faststart",
+            "-an",
+            str(output_path),
         ]
-        if fallback_map_audio is not None:
-            fallback_command.extend(
-                [
-                    "-map",
-                    fallback_map_audio,
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "192k",
-                    "-ac",
-                    "2",
-                    "-ar",
-                    "48000",
-                ]
-            )
-        else:
-            fallback_command.append("-an")
-        fallback_command.append(str(output_path))
+        _run_command(command)
+        return
 
-    _run_with_loudnorm_fallback(command, fallback_command)
+    audio_analysis_command: list[str] | None = None
+    if two_pass_loudnorm:
+        analysis_filter_graph, _, analysis_audio_map = _build_filter_complex(
+            segments,
+            include_audio=True,
+            include_video=False,
+            crossfade_seconds=crossfade_seconds,
+            audio_fade_seconds=audio_fade_seconds,
+            audio_post_filter=LOUDNORM_ANALYSIS_FILTER,
+        )
+        if analysis_audio_map is not None:
+            audio_analysis_command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-y",
+                "-i",
+                str(input_path),
+                "-filter_complex",
+                analysis_filter_graph,
+                "-map",
+                analysis_audio_map,
+                "-f",
+                "null",
+                "-",
+            ]
+
+    loudnorm_filter = _select_loudnorm_filter(
+        two_pass_loudnorm=two_pass_loudnorm,
+        analysis_command=audio_analysis_command,
+    )
+
+    normalized_filter_graph, map_video, map_audio = _build_filter_complex(
+        segments,
+        include_audio=True,
+        include_video=True,
+        allow_upscale=allow_upscale,
+        crossfade_seconds=crossfade_seconds,
+        audio_fade_seconds=audio_fade_seconds,
+        audio_post_filter=loudnorm_filter,
+    )
+    if map_video is None or map_audio is None:
+        raise EditorError("Failed to build audio/video filter graph.")
+
+    fallback_filter_graph, fallback_video_map, fallback_audio_map = _build_filter_complex(
+        segments,
+        include_audio=True,
+        include_video=True,
+        allow_upscale=allow_upscale,
+        crossfade_seconds=crossfade_seconds,
+        audio_fade_seconds=audio_fade_seconds,
+        audio_post_filter=None,
+    )
+    if fallback_video_map is None or fallback_audio_map is None:
+        raise EditorError("Failed to build fallback audio/video filter graph.")
+
+    normalized_command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(input_path),
+        "-filter_complex",
+        normalized_filter_graph,
+        "-map",
+        map_video,
+        *_video_codec_args(video_encoder=video_encoder, crf=crf, preset=preset),
+        "-movflags",
+        "+faststart",
+        "-map",
+        map_audio,
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ac",
+        "2",
+        "-ar",
+        "48000",
+        str(output_path),
+    ]
+    fallback_command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(input_path),
+        "-filter_complex",
+        fallback_filter_graph,
+        "-map",
+        fallback_video_map,
+        *_video_codec_args(video_encoder=video_encoder, crf=crf, preset=preset),
+        "-movflags",
+        "+faststart",
+        "-map",
+        fallback_audio_map,
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ac",
+        "2",
+        "-ar",
+        "48000",
+        str(output_path),
+    ]
+    _run_with_loudnorm_fallback(normalized_command, fallback_command)
 
 
 def transcode_full_match(
@@ -458,6 +691,9 @@ def transcode_full_match(
     output_path: Path,
     crf: int,
     preset: str,
+    video_encoder: str,
+    allow_upscale: bool,
+    two_pass_loudnorm: bool,
 ) -> None:
     has_audio = _has_audio_stream(input_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -468,45 +704,62 @@ def transcode_full_match(
         "-i",
         str(input_path),
         "-vf",
-        "scale=w=1920:h=1080:force_original_aspect_ratio=decrease,"
-        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,fps=60,format=yuv420p",
-        "-c:v",
-        "libx264",
-        "-preset",
-        preset,
-        "-crf",
-        str(crf),
+        _video_postprocess_filter(allow_upscale=allow_upscale),
+        *_video_codec_args(video_encoder=video_encoder, crf=crf, preset=preset),
         "-movflags",
         "+faststart",
     ]
-    command = base_command[:]
-    fallback_command: list[str] | None = None
-    if has_audio:
-        audio_encode = [
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ac",
-            "2",
-            "-ar",
-            "48000",
-        ]
-        command.extend(
-            [
-                "-af",
-                LOUDNORM_FILTER,
-            ]
-        )
-        command.extend(audio_encode)
-        fallback_command = base_command + audio_encode
-    else:
-        command.append("-an")
 
-    command.append(str(output_path))
-    if fallback_command is not None:
-        fallback_command.append(str(output_path))
-    _run_with_loudnorm_fallback(command, fallback_command)
+    if not has_audio:
+        command = base_command + ["-an", str(output_path)]
+        _run_command(command)
+        return
+
+    analysis_command: list[str] | None = None
+    if two_pass_loudnorm:
+        analysis_command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-y",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-af",
+            LOUDNORM_ANALYSIS_FILTER,
+            "-f",
+            "null",
+            "-",
+        ]
+
+    loudnorm_filter = _select_loudnorm_filter(
+        two_pass_loudnorm=two_pass_loudnorm,
+        analysis_command=analysis_command,
+    )
+    normalized_command = base_command + [
+        "-af",
+        loudnorm_filter,
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ac",
+        "2",
+        "-ar",
+        "48000",
+        str(output_path),
+    ]
+    fallback_command = base_command + [
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ac",
+        "2",
+        "-ar",
+        "48000",
+        str(output_path),
+    ]
+    _run_with_loudnorm_fallback(normalized_command, fallback_command)
 
 
 def analyze_recording(
@@ -583,8 +836,18 @@ def _validate_cli_options(args: argparse.Namespace) -> None:
         if args.max_clips < 1:
             raise EditorError("--max-clips must be >= 1.")
 
-    if args.command in {"render", "auto", "full"} and not 0 <= args.crf <= 51:
-        raise EditorError("--crf must be between 0 and 51.")
+    if args.command in {"render", "auto"}:
+        for option_name in ("crossfade-seconds", "audio-fade-seconds"):
+            option_value = getattr(args, option_name.replace("-", "_"))
+            _require_finite(option_name, option_value)
+            if option_value < 0:
+                raise EditorError(f"--{option_name} must be >= 0.")
+
+    if args.command in {"render", "auto", "full"}:
+        if not 0 <= args.crf <= 51:
+            raise EditorError("--crf must be between 0 and 51.")
+        if args.video_encoder not in VIDEO_ENCODERS:
+            raise EditorError(f"--video-encoder must be one of: {', '.join(VIDEO_ENCODERS)}.")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -618,6 +881,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     render.add_argument("--output", type=Path, default=Path("highlights.mp4"))
     render.add_argument("--crf", type=int, default=20)
     render.add_argument(
+        "--video-encoder",
+        type=str,
+        default="libx264",
+        choices=VIDEO_ENCODERS,
+        help="Video encoder. Hardware options are available when supported by your ffmpeg build.",
+    )
+    render.add_argument(
+        "--allow-upscale",
+        action="store_true",
+        help="Upscale video up to 1080p. By default, smaller sources are padded without upscaling.",
+    )
+    render.add_argument(
+        "--crossfade-seconds",
+        type=float,
+        default=0.0,
+        help="Crossfade duration between highlight clips. 0 disables crossfades.",
+    )
+    render.add_argument(
+        "--audio-fade-seconds",
+        type=float,
+        default=0.03,
+        help="Fade-in/out duration applied per clip to reduce click artifacts.",
+    )
+    render.add_argument(
+        "--two-pass-loudnorm",
+        action="store_true",
+        help="Use two-pass loudness normalization (slower, more consistent output).",
+    )
+    render.add_argument(
         "--preset",
         type=str,
         default="medium",
@@ -638,6 +930,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     auto.add_argument("--max-clips", type=int, default=20)
     auto.add_argument("--crf", type=int, default=20)
     auto.add_argument(
+        "--video-encoder",
+        type=str,
+        default="libx264",
+        choices=VIDEO_ENCODERS,
+        help="Video encoder. Hardware options are available when supported by your ffmpeg build.",
+    )
+    auto.add_argument(
+        "--allow-upscale",
+        action="store_true",
+        help="Upscale video up to 1080p. By default, smaller sources are padded without upscaling.",
+    )
+    auto.add_argument(
+        "--crossfade-seconds",
+        type=float,
+        default=0.0,
+        help="Crossfade duration between highlight clips. 0 disables crossfades.",
+    )
+    auto.add_argument(
+        "--audio-fade-seconds",
+        type=float,
+        default=0.03,
+        help="Fade-in/out duration applied per clip to reduce click artifacts.",
+    )
+    auto.add_argument(
+        "--two-pass-loudnorm",
+        action="store_true",
+        help="Use two-pass loudness normalization (slower, more consistent output).",
+    )
+    auto.add_argument(
         "--preset",
         type=str,
         default="medium",
@@ -651,6 +972,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     full.add_argument("input", type=Path, help="Path to OBS recording")
     full.add_argument("--output", type=Path, default=Path("full-match-youtube.mp4"))
     full.add_argument("--crf", type=int, default=20)
+    full.add_argument(
+        "--video-encoder",
+        type=str,
+        default="libx264",
+        choices=VIDEO_ENCODERS,
+        help="Video encoder. Hardware options are available when supported by your ffmpeg build.",
+    )
+    full.add_argument(
+        "--allow-upscale",
+        action="store_true",
+        help="Upscale video up to 1080p. By default, smaller sources are padded without upscaling.",
+    )
+    full.add_argument(
+        "--two-pass-loudnorm",
+        action="store_true",
+        help="Use two-pass loudness normalization (slower, more consistent output).",
+    )
     full.add_argument(
         "--preset",
         type=str,
@@ -694,6 +1032,11 @@ def main(argv: list[str] | None = None) -> int:
                 output_path=args.output,
                 crf=args.crf,
                 preset=args.preset,
+                video_encoder=args.video_encoder,
+                allow_upscale=args.allow_upscale,
+                crossfade_seconds=args.crossfade_seconds,
+                audio_fade_seconds=args.audio_fade_seconds,
+                two_pass_loudnorm=args.two_pass_loudnorm,
             )
             print(f"Rendered highlights: {args.output}")
             return 0
@@ -714,6 +1057,11 @@ def main(argv: list[str] | None = None) -> int:
                 output_path=args.output,
                 crf=args.crf,
                 preset=args.preset,
+                video_encoder=args.video_encoder,
+                allow_upscale=args.allow_upscale,
+                crossfade_seconds=args.crossfade_seconds,
+                audio_fade_seconds=args.audio_fade_seconds,
+                two_pass_loudnorm=args.two_pass_loudnorm,
             )
             print(
                 f"Rendered {args.output} using {stats['segment_count']} segments "
@@ -727,6 +1075,9 @@ def main(argv: list[str] | None = None) -> int:
                 output_path=args.output,
                 crf=args.crf,
                 preset=args.preset,
+                video_encoder=args.video_encoder,
+                allow_upscale=args.allow_upscale,
+                two_pass_loudnorm=args.two_pass_loudnorm,
             )
             print(f"Rendered full match: {args.output}")
             return 0
