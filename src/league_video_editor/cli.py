@@ -14,7 +14,7 @@ from pathlib import Path
 
 SCENE_PTS_PATTERN = re.compile(r"pts_time:(-?\d+(?:\.\d+)?)")
 LOUDNORM_FILTER = "loudnorm=I=-14:LRA=11:TP=-1.5"
-LOUDNORM_NONFINITE_ERROR = "Input contains (near) NaN/+-Inf"
+LOUDNORM_NONFINITE_PATTERN = re.compile(r"input contains.*nan.*inf", re.IGNORECASE | re.DOTALL)
 
 
 class EditorError(RuntimeError):
@@ -64,7 +64,13 @@ def _probe_duration_seconds(input_path: Path) -> float:
     duration_text = result.stdout.strip()
     if not duration_text:
         raise EditorError(f"Could not read duration from {input_path}")
-    return float(duration_text)
+    try:
+        duration = float(duration_text)
+    except ValueError as error:
+        raise EditorError(f"Could not parse duration from {input_path}: {duration_text!r}") from error
+    if not math.isfinite(duration) or duration < 0:
+        raise EditorError(f"Duration is not a valid finite value for {input_path}: {duration_text!r}")
+    return duration
 
 
 def _has_audio_stream(input_path: Path) -> bool:
@@ -250,8 +256,19 @@ def read_plan(plan_path: Path) -> list[Segment]:
             raise EditorError(
                 f"Segment at index {index} must include numeric 'start' and 'end' in plan: {plan_path}"
             ) from error
-        if end > start:
-            segments.append(Segment(start=start, end=end))
+        if not math.isfinite(start) or not math.isfinite(end):
+            raise EditorError(
+                f"Segment at index {index} has non-finite 'start'/'end' in plan: {plan_path}"
+            )
+        if start < 0 or end < 0:
+            raise EditorError(
+                f"Segment at index {index} has negative 'start'/'end' in plan: {plan_path}"
+            )
+        if end <= start:
+            raise EditorError(
+                f"Segment at index {index} must have end > start in plan: {plan_path}"
+            )
+        segments.append(Segment(start=start, end=end))
     return segments
 
 
@@ -299,7 +316,7 @@ def _looks_like_loudnorm_nonfinite_error(error: subprocess.CalledProcessError) -
     stderr = error.stderr or ""
     stdout = error.stdout or ""
     combined_output = f"{stderr}\n{stdout}"
-    return LOUDNORM_NONFINITE_ERROR in combined_output
+    return bool(LOUDNORM_NONFINITE_PATTERN.search(combined_output))
 
 
 def _run_with_loudnorm_fallback(
