@@ -213,11 +213,36 @@ def write_plan(
 
 
 def read_plan(plan_path: Path) -> list[Segment]:
-    data = json.loads(plan_path.read_text(encoding="utf-8"))
+    try:
+        raw_text = plan_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise EditorError(f"Could not read plan file: {plan_path}") from error
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as error:
+        raise EditorError(f"Plan file is not valid JSON: {plan_path}") from error
+
+    if not isinstance(data, dict):
+        raise EditorError(f"Plan JSON must be an object: {plan_path}")
+
+    raw_segments = data.get("segments", [])
+    if not isinstance(raw_segments, list):
+        raise EditorError(f"'segments' must be a list in plan: {plan_path}")
+
     segments: list[Segment] = []
-    for raw in data.get("segments", []):
-        start = float(raw["start"])
-        end = float(raw["end"])
+    for index, raw in enumerate(raw_segments):
+        if not isinstance(raw, dict):
+            raise EditorError(
+                f"Segment at index {index} is not an object in plan: {plan_path}"
+            )
+        try:
+            start = float(raw["start"])
+            end = float(raw["end"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise EditorError(
+                f"Segment at index {index} must include numeric 'start' and 'end' in plan: {plan_path}"
+            ) from error
         if end > start:
             segments.append(Segment(start=start, end=end))
     return segments
@@ -571,4 +596,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
