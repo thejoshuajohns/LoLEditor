@@ -1,6 +1,16 @@
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
-from league_video_editor.cli import Segment, build_segments, merge_segments, sample_evenly
+from league_video_editor.cli import (
+    EditorError,
+    Segment,
+    build_segments,
+    merge_segments,
+    read_plan,
+    sample_evenly,
+)
 
 
 class SegmentLogicTests(unittest.TestCase):
@@ -32,7 +42,29 @@ class SegmentLogicTests(unittest.TestCase):
         self.assertEqual(len(segments), 3)
         self.assertGreater(segments[0].duration, 0.0)
 
+    def test_read_plan_missing_file_raises_editor_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            missing_plan = Path(temp_dir) / "missing-plan.json"
+            with self.assertRaisesRegex(EditorError, "Could not read plan file"):
+                read_plan(missing_plan)
+
+    def test_read_plan_invalid_json_raises_editor_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            plan_path = Path(temp_dir) / "plan.json"
+            plan_path.write_text("{not-json", encoding="utf-8")
+            with self.assertRaisesRegex(EditorError, "not valid JSON"):
+                read_plan(plan_path)
+
+    def test_read_plan_invalid_segment_shape_raises_editor_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            plan_path = Path(temp_dir) / "plan.json"
+            plan_path.write_text(
+                json.dumps({"segments": [{"start": "oops", "end": 10.0}]}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(EditorError, "Segment at index 0"):
+                read_plan(plan_path)
+
 
 if __name__ == "__main__":
     unittest.main()
-
