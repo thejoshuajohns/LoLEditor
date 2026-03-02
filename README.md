@@ -10,7 +10,9 @@ Create YouTube-ready videos from your League of Legends OBS recordings.
   - detected in-game spawn/start (skips client/loading when detected)
   - end of the match (nexus finish coverage)
 - Uses a balanced target runtime by default (about 20 minutes) with fewer, longer cuts.
-- Prioritizes death moments by detecting gray-screen transitions and keeping lead-in context.
+- Prioritizes kill/assist/death context:
+  - detects high-intensity combat windows and keeps lead-in/setup
+  - detects gray-screen death transitions and keeps lead-in context
 - Renders a highlight montage (`highlights.mp4`) with:
   - 1080p output
   - 60 FPS
@@ -73,7 +75,8 @@ lol-video-editor analyze /path/to/recording.mp4 \
   --clip-after 14 \
   --min-gap-seconds 20 \
   --max-clips 24 \
-  --target-duration-seconds 1200 \
+  --target-duration-ratio 0.66 \
+  --target-duration-seconds 0 \
   --intro-seconds 120 \
   --outro-seconds 60
 ```
@@ -81,8 +84,10 @@ lol-video-editor analyze /path/to/recording.mp4 \
 Notes:
 - Lower `--scene-threshold` = more moments detected.
 - Higher `--min-gap-seconds` = fewer clips, less spam.
-- `--vision-scoring heuristic` (default) uses frame-motion + color heuristics to reduce idle/death-map segments while keeping lane context.
-- `--target-duration-seconds 0` means no cap (longer output with fewer cuts).
+- `--vision-scoring heuristic` (default) uses frame-motion + color heuristics to keep lane context while emphasizing combat/death moments.
+- By default, highlights target ~2/3 of the source match duration (`--target-duration-ratio 0.6667`).
+- Set `--target-duration-seconds` to a positive value to force an absolute target.
+- Set both `--target-duration-seconds 0` and `--target-duration-ratio 0` for an uncapped target.
 
 ### 2) Render (from existing plan)
 
@@ -106,6 +111,16 @@ lol-video-editor auto /path/to/recording.mp4 \
 lol-video-editor full /path/to/recording.mp4 \
   --output full-match-youtube.mp4
 ```
+
+### 5) Watchability analysis
+
+```bash
+lol-video-editor watchability /path/to/highlights.mp4 \
+  --report watchability-report.json
+```
+
+Outputs a heuristic score (0-100), rating, pacing/activity metrics, and improvement suggestions.
+The watchability pass auto-retries lower scene thresholds when no events are detected and ignores padded borders during frame sampling.
 
 ## Editing the plan manually
 

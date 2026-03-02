@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from collections import deque
 import json
 import math
@@ -22,17 +23,25 @@ SIGNALSTATS_YDIF_PATTERN = re.compile(r"lavfi\.signalstats\.YDIF=([-+]?\d+(?:\.\
 SIGNALSTATS_SATAVG_PATTERN = re.compile(
     r"lavfi\.signalstats\.SATAVG=([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
 )
+CROPDETECT_PATTERN = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
 LOUDNORM_FILTER = "loudnorm=I=-14:LRA=11:TP=-1.5"
 LOUDNORM_NONFINITE_PATTERN = re.compile(r"input contains.*nan.*inf", re.IGNORECASE | re.DOTALL)
 LOUDNORM_ANALYSIS_FILTER = f"{LOUDNORM_FILTER}:print_format=json"
 VIDEO_ENCODERS = ("libx264", "h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf")
 DEFAULT_TARGET_DURATION_SECONDS = 1200.0
+DEFAULT_TARGET_DURATION_RATIO = 2.0 / 3.0
 DEFAULT_INTRO_SECONDS = 120.0
 DEFAULT_OUTRO_SECONDS = 60.0
 DEFAULT_VISION_SCORING = "heuristic"
 DEFAULT_VISION_SAMPLE_FPS = 1.0
 DEFAULT_VISION_WINDOW_SECONDS = 12.0
 DEFAULT_VISION_STEP_SECONDS = 6.0
+ADAPTIVE_SCENE_THRESHOLD_MIN = 0.08
+ADAPTIVE_SCENE_THRESHOLD_FACTORS = (1.0, 0.75, 0.6, 0.45)
+EVENT_CONTEXT_DEATH_BEFORE_SECONDS = 24.0
+EVENT_CONTEXT_DEATH_AFTER_SECONDS = 14.0
+EVENT_CONTEXT_COMBAT_BEFORE_SECONDS = 18.0
+EVENT_CONTEXT_COMBAT_AFTER_SECONDS = 12.0
 
 
 class EditorError(RuntimeError):
@@ -149,7 +158,7 @@ def _probe_duration_seconds(input_path: Path) -> float:
         ],
         capture_output=True,
     )
-    duration_text = result.stdout.strip()
+    duration_text = (result.stdout or "").strip()
     if not duration_text:
         raise EditorError(f"Could not read duration from {input_path}")
     try:
@@ -185,6 +194,8 @@ def _detect_scene_events_with_progress(
     cmd: list[str],
     *,
     duration_seconds: float,
+    progress_label: str | None = "Analyzing scenes",
+    progress_callback: Callable[[float], None] | None = None,
 ) -> list[float]:
     events: set[float] = set()
     last_output_ratio = -1.0
@@ -213,21 +224,27 @@ def _detect_scene_events_with_progress(
                 current_seconds = _parse_ffmpeg_clock_to_seconds(time_match.group(1))
                 progress_ratio = min(1.0, current_seconds / duration_seconds)
                 if progress_ratio >= last_output_ratio + 0.01 or progress_ratio >= 1.0:
-                    print(
-                        _render_progress_line("Analyzing scenes", progress_ratio),
-                        end="",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    if progress_label is not None:
+                        print(
+                            _render_progress_line(progress_label, progress_ratio),
+                            end="",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    if progress_callback is not None:
+                        progress_callback(progress_ratio)
                     last_output_ratio = progress_ratio
 
         return_code = process.wait()
         if duration_seconds > 0:
-            print(
-                _render_progress_line("Analyzing scenes", 1.0),
-                file=sys.stderr,
-                flush=True,
-            )
+            if progress_label is not None:
+                print(
+                    _render_progress_line(progress_label, 1.0),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if progress_callback is not None:
+                progress_callback(1.0)
         if return_code != 0:
             raise subprocess.CalledProcessError(
                 return_code,
@@ -265,6 +282,8 @@ def detect_scene_events(
     *,
     duration_seconds: float | None = None,
     show_progress: bool = False,
+    progress_label: str | None = "Analyzing scenes",
+    progress_callback: Callable[[float], None] | None = None,
 ) -> list[float]:
     cmd = [
         "ffmpeg",
@@ -284,12 +303,80 @@ def detect_scene_events(
         return _detect_scene_events_with_progress(
             cmd,
             duration_seconds=duration_seconds,
+            progress_label=progress_label,
+            progress_callback=progress_callback,
         )
 
     result = _run_command(cmd, capture_output=True)
     output = (result.stderr or "") + "\n" + (result.stdout or "")
     matches = SCENE_PTS_PATTERN.findall(output)
     return sorted({float(value) for value in matches if float(value) >= 0.0})
+
+
+def _adaptive_scene_thresholds(
+    scene_threshold: float,
+    *,
+    minimum_threshold: float = ADAPTIVE_SCENE_THRESHOLD_MIN,
+) -> list[float]:
+    clamped_threshold = min(1.0, max(0.0, scene_threshold))
+    thresholds: list[float] = []
+    for factor in ADAPTIVE_SCENE_THRESHOLD_FACTORS:
+        candidate = max(minimum_threshold, clamped_threshold * factor)
+        if any(abs(candidate - existing) < 1e-6 for existing in thresholds):
+            continue
+        thresholds.append(candidate)
+    if not thresholds:
+        thresholds.append(clamped_threshold)
+    return thresholds
+
+
+def detect_scene_events_adaptive(
+    input_path: Path,
+    scene_threshold: float,
+    *,
+    duration_seconds: float | None = None,
+    show_progress: bool = False,
+    progress_label: str | None = "Analyzing scenes",
+    progress_callback: Callable[[float], None] | None = None,
+) -> tuple[list[float], float]:
+    thresholds = _adaptive_scene_thresholds(scene_threshold)
+    detected_events: list[float] = []
+    selected_threshold = thresholds[0]
+    for index, candidate_threshold in enumerate(thresholds):
+        attempt_label = progress_label
+        if show_progress and progress_label is not None and index > 0:
+            attempt_label = f"{progress_label} retry {index + 1}"
+        detected_events = detect_scene_events(
+            input_path,
+            candidate_threshold,
+            duration_seconds=duration_seconds,
+            show_progress=show_progress,
+            progress_label=attempt_label,
+            progress_callback=progress_callback,
+        )
+        selected_threshold = candidate_threshold
+        if detected_events:
+            if index > 0:
+                print(
+                    (
+                        f"Scene threshold adjusted to {candidate_threshold:.3f}; "
+                        f"detected {len(detected_events)} scene events."
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return detected_events, selected_threshold
+        if index + 1 < len(thresholds):
+            next_threshold = thresholds[index + 1]
+            print(
+                (
+                    f"No scene events at threshold {candidate_threshold:.3f}; "
+                    f"retrying with {next_threshold:.3f}."
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+    return detected_events, selected_threshold
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -315,25 +402,99 @@ def _normalize(value: float, *, low: float, high: float) -> float:
     return min(1.0, max(0.0, (value - low) / span))
 
 
+def _detect_watchability_crop_filter(
+    input_path: Path,
+    *,
+    duration_seconds: float,
+) -> str | None:
+    sample_duration = max(0.0, min(duration_seconds, 300.0))
+    if sample_duration <= 0:
+        return None
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-ss",
+        "0",
+        "-t",
+        f"{sample_duration:.3f}",
+        "-i",
+        str(input_path),
+        "-vf",
+        "fps=0.500,cropdetect=limit=0.08:round=2:reset=0",
+        "-an",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = _run_command(cmd, capture_output=True)
+    except subprocess.CalledProcessError:
+        return None
+
+    output = (result.stderr or "") + "\n" + (result.stdout or "")
+    matches = CROPDETECT_PATTERN.findall(output)
+    if not matches:
+        return None
+
+    crop_counts: dict[tuple[int, int, int, int], int] = {}
+    for width_text, height_text, x_text, y_text in matches:
+        width = int(width_text)
+        height = int(height_text)
+        x_offset = int(x_text)
+        y_offset = int(y_text)
+        if width <= 0 or height <= 0 or x_offset < 0 or y_offset < 0:
+            continue
+        crop_counts[(width, height, x_offset, y_offset)] = (
+            crop_counts.get((width, height, x_offset, y_offset), 0) + 1
+        )
+
+    if not crop_counts:
+        return None
+
+    best_crop, _ = max(
+        crop_counts.items(),
+        key=lambda item: (item[1], item[0][0] * item[0][1]),
+    )
+    width, height, x_offset, y_offset = best_crop
+    return f"crop={width}:{height}:{x_offset}:{y_offset}"
+
+
 def _extract_signalstats_samples(
     input_path: Path,
     *,
     duration_seconds: float,
     sample_fps: float,
     show_progress: bool,
+    progress_label: str | None = "Scoring gameplay",
+    progress_callback: Callable[[float], None] | None = None,
 ) -> list[tuple[float, float, float]]:
+    if show_progress and progress_callback is not None:
+        progress_callback(0.01)
+    crop_filter = _detect_watchability_crop_filter(
+        input_path,
+        duration_seconds=duration_seconds,
+    )
+    if show_progress and progress_callback is not None:
+        progress_callback(0.06)
+
+    signal_filters = []
+    if crop_filter is not None:
+        signal_filters.append(crop_filter)
+    signal_filters.extend(
+        [
+            f"fps={sample_fps:.3f}",
+            "scale=320:-1:flags=fast_bilinear",
+            "signalstats",
+            "metadata=print",
+        ]
+    )
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-i",
         str(input_path),
         "-vf",
-        (
-            f"fps={sample_fps:.3f},"
-            "scale=320:-1:flags=fast_bilinear,"
-            "signalstats,"
-            "metadata=print"
-        ),
+        ",".join(signal_filters),
         "-an",
         "-f",
         "null",
@@ -394,12 +555,15 @@ def _extract_signalstats_samples(
                 if progress_time is not None:
                     progress_ratio = min(1.0, max(0.0, progress_time / duration_seconds))
                     if progress_ratio >= last_output_ratio + 0.01 or progress_ratio >= 1.0:
-                        print(
-                            _render_progress_line("Scoring gameplay", progress_ratio),
-                            end="",
-                            file=sys.stderr,
-                            flush=True,
-                        )
+                        if progress_label is not None:
+                            print(
+                                _render_progress_line(progress_label, progress_ratio),
+                                end="",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        if progress_callback is not None:
+                            progress_callback(progress_ratio)
                         last_output_ratio = progress_ratio
 
         if current_time is not None and current_motion is not None and current_saturation is not None:
@@ -407,11 +571,14 @@ def _extract_signalstats_samples(
 
         return_code = process.wait()
         if show_progress and duration_seconds > 0:
-            print(
-                _render_progress_line("Scoring gameplay", 1.0),
-                file=sys.stderr,
-                flush=True,
-            )
+            if progress_label is not None:
+                print(
+                    _render_progress_line(progress_label, 1.0),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if progress_callback is not None:
+                progress_callback(1.0)
         if return_code != 0:
             raise subprocess.CalledProcessError(
                 return_code,
@@ -506,12 +673,16 @@ def score_vision_activity(
     window_seconds: float,
     step_seconds: float,
     show_progress: bool,
+    progress_label: str | None = "Scoring gameplay",
+    progress_callback: Callable[[float], None] | None = None,
 ) -> list[VisionWindow]:
     samples = _extract_signalstats_samples(
         input_path,
         duration_seconds=duration_seconds,
         sample_fps=sample_fps,
         show_progress=show_progress,
+        progress_label=progress_label,
+        progress_callback=progress_callback,
     )
     return _compute_vision_window_scores(
         frame_samples=samples,
@@ -630,6 +801,59 @@ def _detect_death_cues(
         death_cues.append(cue_time)
 
     return death_cues
+
+
+def _detect_combat_cues(
+    vision_windows: list[VisionWindow],
+    *,
+    min_spacing_seconds: float = 28.0,
+) -> list[float]:
+    if len(vision_windows) < 3:
+        return []
+
+    ordered = sorted(vision_windows, key=lambda window: window.start)
+    scores = [window.score for window in ordered]
+    motions = [window.motion for window in ordered]
+    densities = [window.scene_density for window in ordered]
+    saturations = [window.saturation for window in ordered]
+
+    score_threshold = _percentile(scores, 0.68)
+    motion_threshold = _percentile(motions, 0.68)
+    density_threshold = _percentile(densities, 0.62)
+    min_color_threshold = max(10.0, _percentile(saturations, 0.35))
+
+    combat_cues: list[float] = []
+    for index, current in enumerate(ordered):
+        is_active = (
+            current.score >= score_threshold
+            and (current.motion >= motion_threshold or current.scene_density >= density_threshold)
+            and current.saturation >= min_color_threshold
+        )
+        if not is_active:
+            continue
+
+        previous = ordered[index - 1] if index > 0 else None
+        next_window = ordered[index + 1] if index + 1 < len(ordered) else None
+        has_rise = (
+            previous is None
+            or previous.score < current.score * 0.92
+            or previous.motion < motion_threshold * 0.9
+        )
+        has_follow_through = (
+            next_window is None
+            or next_window.score >= score_threshold * 0.72
+            or next_window.motion >= motion_threshold * 0.78
+        )
+        if not has_rise or not has_follow_through:
+            continue
+
+        lead_in_seconds = max(12.0, (current.end - current.start) * 0.9)
+        cue_time = max(0.0, current.start - lead_in_seconds)
+        if combat_cues and cue_time - combat_cues[-1] < min_spacing_seconds:
+            continue
+        combat_cues.append(cue_time)
+
+    return combat_cues
 
 
 def sample_evenly(values: list[float], max_items: int) -> list[float]:
@@ -828,8 +1052,14 @@ def build_segments(
     used_fallback = False
     spacing_seconds = min_gap_seconds * (1.4 if vision_windows else 1.0)
     death_cues = _detect_death_cues(vision_windows or [])
-    if death_cues:
-        middle_clip_target = min(max_clips, max(middle_clip_target, len(death_cues)))
+    combat_cues = _detect_combat_cues(vision_windows or [])
+    forced_cues = sorted(
+        [("death", cue_time) for cue_time in death_cues]
+        + [("combat", cue_time) for cue_time in combat_cues],
+        key=lambda cue: cue[1],
+    )
+    if forced_cues:
+        middle_clip_target = min(max_clips, max(middle_clip_target, len(forced_cues)))
     if middle_clip_target > 0:
         effective_clip_before = clip_before
         effective_clip_after = clip_after
@@ -852,38 +1082,70 @@ def build_segments(
                 events,
                 min_gap_seconds=min_gap_seconds,
                 duration_seconds=duration_seconds,
-                clip_before=effective_clip_before,
-                clip_after=effective_clip_after,
-            )
+                    clip_before=effective_clip_before,
+                    clip_after=effective_clip_after,
+                )
 
-        selected_centers: list[float] = []
-        for cue_time in death_cues:
+        forced_centers: list[float] = []
+        forced_segments: list[Segment] = []
+        candidate_forced_cues = forced_cues
+        if len(candidate_forced_cues) > middle_clip_target:
+            sampled_indexes = sample_evenly(
+                list(range(len(candidate_forced_cues))),
+                middle_clip_target,
+            )
+            candidate_forced_cues = [candidate_forced_cues[index] for index in sampled_indexes]
+
+        for cue_type, cue_time in candidate_forced_cues:
             if cue_time <= interior_start or cue_time >= interior_end:
                 continue
-            if any(abs(cue_time - chosen) < spacing_seconds for chosen in selected_centers):
+            if any(abs(cue_time - chosen) < spacing_seconds for chosen in forced_centers):
                 continue
-            selected_centers.append(cue_time)
-            if len(selected_centers) >= middle_clip_target:
+            if cue_type == "death":
+                cue_before = max(effective_clip_before, EVENT_CONTEXT_DEATH_BEFORE_SECONDS)
+                cue_after = max(effective_clip_after, EVENT_CONTEXT_DEATH_AFTER_SECONDS)
+            else:
+                cue_before = max(effective_clip_before, EVENT_CONTEXT_COMBAT_BEFORE_SECONDS)
+                cue_after = max(effective_clip_after, EVENT_CONTEXT_COMBAT_AFTER_SECONDS)
+            segment = _build_segment_from_center(
+                cue_time,
+                clip_before=cue_before,
+                clip_after=cue_after,
+                clamp_start=interior_start,
+                clamp_end=interior_end,
+            )
+            if segment is None:
+                continue
+            forced_centers.append(cue_time)
+            forced_segments.append(segment)
+            if len(forced_centers) >= middle_clip_target:
                 break
+
+        middle_segments.extend(forced_segments)
+        remaining_slots = max(0, middle_clip_target - len(forced_centers))
+        selected_centers: list[float] = []
+        occupied_centers = forced_centers[:]
 
         for event in ranked_events:
+            if len(selected_centers) >= remaining_slots:
+                break
             if event <= interior_start or event >= interior_end:
                 continue
-            if any(abs(event - chosen) < spacing_seconds for chosen in selected_centers):
+            if any(abs(event - chosen) < spacing_seconds for chosen in occupied_centers):
                 continue
             selected_centers.append(event)
-            if len(selected_centers) >= middle_clip_target:
-                break
+            occupied_centers.append(event)
 
-        if len(selected_centers) < middle_clip_target:
+        if len(selected_centers) < remaining_slots:
             used_fallback = True
+            missing = remaining_slots - len(selected_centers)
             selected_centers.extend(
                 _generate_fallback_centers(
                     start=interior_start,
                     end=interior_end,
-                    count=middle_clip_target - len(selected_centers),
+                    count=missing,
                     min_gap_seconds=spacing_seconds,
-                    existing=selected_centers,
+                    existing=occupied_centers + selected_centers,
                 )
             )
 
@@ -1093,6 +1355,24 @@ def _build_filter_complex(
     return ";".join(pieces), video_output_label, audio_output_label
 
 
+def _estimate_render_duration(segments: list[Segment], *, crossfade_seconds: float) -> float:
+    if not segments:
+        return 0.0
+    durations = [segment.duration for segment in segments]
+    if crossfade_seconds <= 0 or len(durations) == 1:
+        return max(0.0, sum(durations))
+
+    running_duration = durations[0]
+    for index in range(1, len(durations)):
+        transition_duration = _effective_transition_duration(
+            crossfade_seconds,
+            left_duration=running_duration,
+            right_duration=durations[index],
+        )
+        running_duration = running_duration + durations[index] - transition_duration
+    return max(0.0, running_duration)
+
+
 def _looks_like_loudnorm_nonfinite_error(error: subprocess.CalledProcessError) -> bool:
     stderr = error.stderr or ""
     stdout = error.stdout or ""
@@ -1187,13 +1467,24 @@ def _select_loudnorm_filter(
 def _run_with_loudnorm_fallback(
     command_with_loudnorm: list[str],
     command_without_loudnorm: list[str] | None,
+    *,
+    progress_label: str | None = None,
+    progress_duration_seconds: float | None = None,
 ) -> None:
     if command_without_loudnorm is None:
-        _run_command(command_with_loudnorm)
+        _run_command_with_stderr_tail(
+            command_with_loudnorm,
+            progress_label=progress_label,
+            duration_seconds=progress_duration_seconds,
+        )
         return
 
     try:
-        _run_command_with_stderr_tail(command_with_loudnorm)
+        _run_command_with_stderr_tail(
+            command_with_loudnorm,
+            progress_label=progress_label,
+            duration_seconds=progress_duration_seconds,
+        )
     except subprocess.CalledProcessError as error:
         if not _looks_like_loudnorm_nonfinite_error(error):
             raise
@@ -1201,10 +1492,65 @@ def _run_with_loudnorm_fallback(
             "Warning: loudnorm failed due to non-finite audio values; retrying without loudness normalization.",
             file=sys.stderr,
         )
-        _run_command(command_without_loudnorm)
+        _run_command_with_stderr_tail(
+            command_without_loudnorm,
+            progress_label=progress_label,
+            duration_seconds=progress_duration_seconds,
+        )
 
 
-def _run_command_with_stderr_tail(cmd: list[str], *, tail_bytes: int = 256 * 1024) -> None:
+def _run_command_with_stderr_tail(
+    cmd: list[str],
+    *,
+    tail_bytes: int = 256 * 1024,
+    progress_label: str | None = None,
+    duration_seconds: float | None = None,
+) -> None:
+    if progress_label is not None and duration_seconds is not None and duration_seconds > 0:
+        stderr_tail: deque[str] = deque(maxlen=120)
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        last_output_ratio = -1.0
+        try:
+            assert process.stderr is not None
+            for line in process.stderr:
+                stderr_tail.append(line)
+                time_match = FFMPEG_TIME_PATTERN.search(line)
+                if not time_match:
+                    continue
+                current_seconds = _parse_ffmpeg_clock_to_seconds(time_match.group(1))
+                progress_ratio = min(1.0, max(0.0, current_seconds / duration_seconds))
+                if progress_ratio >= last_output_ratio + 0.01 or progress_ratio >= 1.0:
+                    print(
+                        _render_progress_line(progress_label, progress_ratio),
+                        end="",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    last_output_ratio = progress_ratio
+
+            return_code = process.wait()
+            print(
+                _render_progress_line(progress_label, 1.0),
+                file=sys.stderr,
+                flush=True,
+            )
+            if return_code != 0:
+                raise subprocess.CalledProcessError(
+                    return_code,
+                    cmd,
+                    stderr="".join(stderr_tail),
+                )
+            return
+        except KeyboardInterrupt:
+            process.terminate()
+            raise
+
     with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as stderr_file:
         completed = subprocess.run(
             cmd,
@@ -1246,6 +1592,10 @@ def render_highlights(
         raise EditorError(
             f"Plan {plan_path} has no segments. Re-run analyze with a lower scene threshold."
         )
+    estimated_duration_seconds = _estimate_render_duration(
+        segments,
+        crossfade_seconds=crossfade_seconds,
+    )
 
     include_audio = _has_audio_stream(input_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1385,7 +1735,12 @@ def render_highlights(
         "48000",
         str(output_path),
     ]
-    _run_with_loudnorm_fallback(normalized_command, fallback_command)
+    _run_with_loudnorm_fallback(
+        normalized_command,
+        fallback_command,
+        progress_label="Rendering highlights",
+        progress_duration_seconds=estimated_duration_seconds,
+    )
 
 
 def transcode_full_match(
@@ -1417,6 +1772,12 @@ def transcode_full_match(
         command = base_command + ["-an", str(output_path)]
         _run_command(command)
         return
+
+    duration_seconds: float | None = None
+    try:
+        duration_seconds = _probe_duration_seconds(input_path)
+    except (EditorError, subprocess.CalledProcessError):
+        duration_seconds = None
 
     analysis_command: list[str] | None = None
     if two_pass_loudnorm:
@@ -1462,7 +1823,12 @@ def transcode_full_match(
         "48000",
         str(output_path),
     ]
-    _run_with_loudnorm_fallback(normalized_command, fallback_command)
+    _run_with_loudnorm_fallback(
+        normalized_command,
+        fallback_command,
+        progress_label="Rendering full match",
+        progress_duration_seconds=duration_seconds,
+    )
 
 
 def analyze_recording(
@@ -1475,6 +1841,7 @@ def analyze_recording(
     min_gap_seconds: float,
     max_clips: int,
     target_duration_seconds: float,
+    target_duration_ratio: float,
     intro_seconds: float,
     outro_seconds: float,
     vision_scoring: str,
@@ -1483,12 +1850,15 @@ def analyze_recording(
     vision_step_seconds: float,
 ) -> dict[str, int | float | bool]:
     duration_seconds = _probe_duration_seconds(input_path)
-    events = detect_scene_events(
+    events, scene_threshold_used = detect_scene_events_adaptive(
         input_path,
         scene_threshold,
         duration_seconds=duration_seconds,
         show_progress=True,
     )
+    resolved_target_duration_seconds = target_duration_seconds
+    if resolved_target_duration_seconds <= 0 and target_duration_ratio > 0:
+        resolved_target_duration_seconds = duration_seconds * min(1.0, target_duration_ratio)
     vision_windows: list[VisionWindow] = []
     if vision_scoring != "off":
         try:
@@ -1516,18 +1886,21 @@ def analyze_recording(
         clip_after=clip_after,
         min_gap_seconds=min_gap_seconds,
         max_clips=max_clips,
-        target_duration_seconds=target_duration_seconds,
+        target_duration_seconds=resolved_target_duration_seconds,
         intro_seconds=intro_seconds,
         outro_seconds=outro_seconds,
         vision_windows=vision_windows,
     )
     settings = {
-        "scene_threshold": scene_threshold,
+        "scene_threshold": scene_threshold_used,
+        "scene_threshold_requested": scene_threshold,
         "clip_before": clip_before,
         "clip_after": clip_after,
         "min_gap_seconds": min_gap_seconds,
         "max_clips": max_clips,
-        "target_duration_seconds": target_duration_seconds,
+        "target_duration_seconds": resolved_target_duration_seconds,
+        "target_duration_seconds_requested": target_duration_seconds,
+        "target_duration_ratio": target_duration_ratio,
         "intro_seconds": intro_seconds,
         "outro_seconds": outro_seconds,
         "vision_scoring": vision_scoring,
@@ -1550,7 +1923,218 @@ def analyze_recording(
         "used_fallback": used_fallback,
         "duration_seconds": duration_seconds,
         "vision_window_count": len(vision_windows),
+        "scene_threshold_used": scene_threshold_used,
     }
+
+
+def _average(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _stddev(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = _average(values)
+    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+    return math.sqrt(max(0.0, variance))
+
+
+def _closeness_score(value: float, *, target: float, tolerance: float) -> float:
+    if tolerance <= 0:
+        return 0.0
+    return max(0.0, 1.0 - abs(value - target) / tolerance)
+
+
+def _build_watchability_report(
+    *,
+    duration_seconds: float,
+    events: list[float],
+    vision_windows: list[VisionWindow],
+    scene_threshold_used: float,
+) -> dict[str, object]:
+    duration_minutes = duration_seconds / 60 if duration_seconds > 0 else 0.0
+    event_rate_per_minute = len(events) / duration_minutes if duration_minutes > 0 else 0.0
+
+    scores = [window.score for window in vision_windows]
+    saturations = [window.saturation for window in vision_windows]
+    avg_score = _average(scores)
+    score_std = _stddev(scores)
+    low_activity_threshold = _percentile(scores, 0.30)
+    high_activity_threshold = _percentile(scores, 0.75)
+    low_activity_ratio = (
+        sum(1 for score in scores if score <= low_activity_threshold) / len(scores)
+        if scores
+        else 1.0
+    )
+    high_activity_ratio = (
+        sum(1 for score in scores if score >= high_activity_threshold) / len(scores)
+        if scores
+        else 0.0
+    )
+    ordered_windows = sorted(vision_windows, key=lambda window: window.start)
+    death_cues = _detect_death_cues(ordered_windows, min_spacing_seconds=20.0)
+    motions = [window.motion for window in ordered_windows]
+    low_motion_threshold = _percentile(motions, 0.45)
+    low_score_threshold = _percentile(scores, 0.50)
+    low_saturation_threshold = _percentile(saturations, 0.30)
+    avg_window_duration = _average([window.end - window.start for window in ordered_windows])
+    death_context_seconds = max(12.0, avg_window_duration * 1.5)
+    death_like_windows = 0
+    for window in ordered_windows:
+        if not death_cues:
+            break
+        center = (window.start + window.end) / 2
+        near_death_transition = any(
+            abs(center - cue_time) <= death_context_seconds for cue_time in death_cues
+        )
+        if not near_death_transition:
+            continue
+        if (
+            window.motion <= low_motion_threshold
+            and window.score <= low_score_threshold
+            and window.saturation <= low_saturation_threshold
+        ):
+            death_like_windows += 1
+    gray_ratio = (
+        death_like_windows / len(ordered_windows)
+        if ordered_windows
+        else 0.0
+    )
+
+    engagement_component = avg_score
+    pacing_component = _closeness_score(event_rate_per_minute, target=8.0, tolerance=8.0)
+    variety_component = min(1.0, score_std / 0.18)
+    idle_component = 1.0 - low_activity_ratio
+    gray_component = 1.0 - min(1.0, gray_ratio * 1.2)
+
+    overall_score = 100.0 * (
+        0.30 * engagement_component
+        + 0.20 * pacing_component
+        + 0.20 * variety_component
+        + 0.20 * idle_component
+        + 0.10 * gray_component
+    )
+    overall_score = min(100.0, max(0.0, overall_score))
+
+    if overall_score >= 80:
+        rating = "excellent"
+    elif overall_score >= 65:
+        rating = "good"
+    elif overall_score >= 50:
+        rating = "fair"
+    else:
+        rating = "rough"
+
+    recommendations: list[str] = []
+    if low_activity_ratio > 0.45:
+        recommendations.append("Trim or speed up extended low-activity windows.")
+    if event_rate_per_minute > 18:
+        recommendations.append("Reduce cut frequency to improve flow continuity.")
+    if event_rate_per_minute < 3:
+        recommendations.append("Include more high-impact moments (fights, objectives, deaths).")
+    if high_activity_ratio < 0.18:
+        recommendations.append("Prioritize more high-intensity sequences to improve excitement.")
+    if gray_ratio > 0.30:
+        recommendations.append("Death/gray-screen time is high; keep only the most informative examples.")
+
+    return {
+        "watchability_score": round(overall_score, 2),
+        "rating": rating,
+        "scene_threshold_used": round(scene_threshold_used, 4),
+        "duration_seconds": round(duration_seconds, 3),
+        "event_count": len(events),
+        "event_rate_per_minute": round(event_rate_per_minute, 3),
+        "avg_activity_score": round(avg_score, 4),
+        "activity_score_stddev": round(score_std, 4),
+        "low_activity_ratio": round(low_activity_ratio, 4),
+        "high_activity_ratio": round(high_activity_ratio, 4),
+        "gray_screen_ratio": round(gray_ratio, 4),
+        "recommendations": recommendations,
+    }
+
+
+def analyze_watchability(
+    *,
+    input_path: Path,
+    scene_threshold: float,
+    vision_sample_fps: float,
+    vision_window_seconds: float,
+    vision_step_seconds: float,
+    show_progress: bool = True,
+) -> dict[str, object]:
+    last_progress_ratio = -1.0
+
+    def emit_progress(ratio: float) -> None:
+        nonlocal last_progress_ratio
+        clamped_ratio = min(1.0, max(0.0, ratio))
+        if clamped_ratio < last_progress_ratio + 0.01 and clamped_ratio < 1.0:
+            return
+        if clamped_ratio >= 1.0:
+            print(
+                _render_progress_line("Analyzing watchability", clamped_ratio),
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                _render_progress_line("Analyzing watchability", clamped_ratio),
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
+        last_progress_ratio = clamped_ratio
+
+    def stage_progress_callback(start_ratio: float, end_ratio: float) -> Callable[[float], None]:
+        stage_span = max(0.0, end_ratio - start_ratio)
+
+        def update(stage_ratio: float) -> None:
+            emit_progress(start_ratio + stage_span * min(1.0, max(0.0, stage_ratio)))
+
+        return update
+
+    if show_progress:
+        emit_progress(0.0)
+    duration_seconds = _probe_duration_seconds(input_path)
+    if show_progress:
+        emit_progress(0.05)
+    events, scene_threshold_used = detect_scene_events_adaptive(
+        input_path,
+        scene_threshold,
+        duration_seconds=duration_seconds,
+        show_progress=show_progress,
+        progress_label=None if show_progress else "Analyzing scenes",
+        progress_callback=(
+            stage_progress_callback(0.05, 0.55) if show_progress else None
+        ),
+    )
+    if show_progress:
+        emit_progress(0.55)
+    vision_windows = score_vision_activity(
+        input_path,
+        events=events,
+        duration_seconds=duration_seconds,
+        sample_fps=vision_sample_fps,
+        window_seconds=vision_window_seconds,
+        step_seconds=vision_step_seconds,
+        show_progress=show_progress,
+        progress_label=None if show_progress else "Scoring gameplay",
+        progress_callback=(
+            stage_progress_callback(0.55, 0.95) if show_progress else None
+        ),
+    )
+    if show_progress:
+        emit_progress(0.95)
+    report = _build_watchability_report(
+        duration_seconds=duration_seconds,
+        events=events,
+        vision_windows=vision_windows,
+        scene_threshold_used=scene_threshold_used,
+    )
+    if show_progress:
+        emit_progress(1.0)
+    return report
 
 
 def _validate_file(input_path: Path) -> None:
@@ -1567,6 +2151,9 @@ def _require_finite(option_name: str, value: float) -> None:
 
 def _validate_cli_options(args: argparse.Namespace) -> None:
     if args.command in {"analyze", "auto"}:
+        target_duration_ratio = float(
+            getattr(args, "target_duration_ratio", DEFAULT_TARGET_DURATION_RATIO)
+        )
         _require_finite("scene-threshold", args.scene_threshold)
         if not 0.0 <= args.scene_threshold <= 1.0:
             raise EditorError("--scene-threshold must be between 0.0 and 1.0.")
@@ -1585,6 +2172,9 @@ def _validate_cli_options(args: argparse.Namespace) -> None:
             _require_finite(option_name, option_value)
             if option_value < 0:
                 raise EditorError(f"--{option_name} must be >= 0.")
+        _require_finite("target-duration-ratio", target_duration_ratio)
+        if not 0.0 <= target_duration_ratio <= 1.0:
+            raise EditorError("--target-duration-ratio must be between 0.0 and 1.0.")
 
         if args.target_duration_seconds < 0:
             raise EditorError("--target-duration-seconds must be >= 0.")
@@ -1599,6 +2189,19 @@ def _validate_cli_options(args: argparse.Namespace) -> None:
 
         if args.max_clips < 1:
             raise EditorError("--max-clips must be >= 1.")
+
+    if args.command == "watchability":
+        _require_finite("scene-threshold", args.scene_threshold)
+        if not 0.0 <= args.scene_threshold <= 1.0:
+            raise EditorError("--scene-threshold must be between 0.0 and 1.0.")
+        for option_name, option_value in (
+            ("vision-sample-fps", args.vision_sample_fps),
+            ("vision-window-seconds", args.vision_window_seconds),
+            ("vision-step-seconds", args.vision_step_seconds),
+        ):
+            _require_finite(option_name, option_value)
+            if option_value <= 0:
+                raise EditorError(f"--{option_name} must be > 0.")
 
     if args.command in {"render", "auto"}:
         for option_name in ("crossfade-seconds", "audio-fade-seconds"):
@@ -1648,8 +2251,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     analyze.add_argument(
         "--target-duration-seconds",
         type=float,
-        default=DEFAULT_TARGET_DURATION_SECONDS,
-        help="Approximate target duration for final highlights output. 0 uses an uncapped target.",
+        default=0.0,
+        help="Absolute target duration override for highlights output. 0 uses --target-duration-ratio.",
+    )
+    analyze.add_argument(
+        "--target-duration-ratio",
+        type=float,
+        default=DEFAULT_TARGET_DURATION_RATIO,
+        help="Target highlights duration as a ratio of source match duration (default: 2/3). Set to 0 to disable ratio targeting.",
     )
     analyze.add_argument(
         "--intro-seconds",
@@ -1753,8 +2362,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     auto.add_argument(
         "--target-duration-seconds",
         type=float,
-        default=DEFAULT_TARGET_DURATION_SECONDS,
-        help="Approximate target duration for final highlights output. 0 uses an uncapped target.",
+        default=0.0,
+        help="Absolute target duration override for highlights output. 0 uses --target-duration-ratio.",
+    )
+    auto.add_argument(
+        "--target-duration-ratio",
+        type=float,
+        default=DEFAULT_TARGET_DURATION_RATIO,
+        help="Target highlights duration as a ratio of source match duration (default: 2/3). Set to 0 to disable ratio targeting.",
     )
     auto.add_argument(
         "--intro-seconds",
@@ -1862,6 +2477,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"],
         help="Encoder preset for libx264 only. Hardware encoders use their own defaults.",
     )
+
+    watchability = subparsers.add_parser(
+        "watchability",
+        help="Analyze a video and report a heuristic watchability score.",
+    )
+    watchability.add_argument("input", type=Path, help="Path to rendered video")
+    watchability.add_argument("--scene-threshold", type=float, default=0.35)
+    watchability.add_argument(
+        "--vision-sample-fps",
+        type=float,
+        default=DEFAULT_VISION_SAMPLE_FPS,
+        help="FPS for low-resolution frame sampling used by watchability analysis.",
+    )
+    watchability.add_argument(
+        "--vision-window-seconds",
+        type=float,
+        default=DEFAULT_VISION_WINDOW_SECONDS,
+        help="Window size used to aggregate watchability activity scores.",
+    )
+    watchability.add_argument(
+        "--vision-step-seconds",
+        type=float,
+        default=DEFAULT_VISION_STEP_SECONDS,
+        help="Step size between consecutive watchability windows.",
+    )
+    watchability.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help="Optional path to write a JSON watchability report.",
+    )
     return parser
 
 
@@ -1885,6 +2531,7 @@ def main(argv: list[str] | None = None) -> int:
                 min_gap_seconds=args.min_gap_seconds,
                 max_clips=args.max_clips,
                 target_duration_seconds=args.target_duration_seconds,
+                target_duration_ratio=args.target_duration_ratio,
                 intro_seconds=args.intro_seconds,
                 outro_seconds=args.outro_seconds,
                 vision_scoring=args.vision_scoring,
@@ -1895,7 +2542,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"Wrote {args.plan} with {stats['segment_count']} segments "
                 f"from {stats['event_count']} detected events "
-                f"(fallback={stats['used_fallback']})."
+                f"(fallback={stats['used_fallback']}, "
+                f"scene-threshold={stats['scene_threshold_used']:.3f})."
             )
             return 0
 
@@ -1926,6 +2574,7 @@ def main(argv: list[str] | None = None) -> int:
                 min_gap_seconds=args.min_gap_seconds,
                 max_clips=args.max_clips,
                 target_duration_seconds=args.target_duration_seconds,
+                target_duration_ratio=args.target_duration_ratio,
                 intro_seconds=args.intro_seconds,
                 outro_seconds=args.outro_seconds,
                 vision_scoring=args.vision_scoring,
@@ -1964,6 +2613,35 @@ def main(argv: list[str] | None = None) -> int:
                 two_pass_loudnorm=args.two_pass_loudnorm,
             )
             print(f"Rendered full match: {args.output}")
+            return 0
+
+        if args.command == "watchability":
+            report = analyze_watchability(
+                input_path=args.input,
+                scene_threshold=args.scene_threshold,
+                vision_sample_fps=args.vision_sample_fps,
+                vision_window_seconds=args.vision_window_seconds,
+                vision_step_seconds=args.vision_step_seconds,
+            )
+            print(
+                f"Watchability score: {report['watchability_score']}/100 "
+                f"({report['rating']})."
+            )
+            print(
+                f"Events/min: {report['event_rate_per_minute']} | "
+                f"Scene threshold: {report['scene_threshold_used']} | "
+                f"Low activity: {report['low_activity_ratio']} | "
+                f"Gray-screen ratio: {report['gray_screen_ratio']}"
+            )
+            recommendations = report.get("recommendations", [])
+            if isinstance(recommendations, list):
+                for recommendation in recommendations:
+                    if isinstance(recommendation, str):
+                        print(f"- {recommendation}")
+            if args.report is not None:
+                args.report.parent.mkdir(parents=True, exist_ok=True)
+                args.report.write_text(json.dumps(report, indent=2), encoding="utf-8")
+                print(f"Wrote watchability report: {args.report}")
             return 0
 
         parser.error(f"Unknown command: {args.command}")
