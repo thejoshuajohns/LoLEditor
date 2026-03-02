@@ -13,6 +13,8 @@ from pathlib import Path
 
 
 SCENE_PTS_PATTERN = re.compile(r"pts_time:(-?\d+(?:\.\d+)?)")
+LOUDNORM_FILTER = "loudnorm=I=-14:LRA=11:TP=-1.5"
+LOUDNORM_NONFINITE_ERROR = "Input contains (near) NaN/+-Inf"
 
 
 class EditorError(RuntimeError):
@@ -253,7 +255,12 @@ def read_plan(plan_path: Path) -> list[Segment]:
     return segments
 
 
-def _build_filter_complex(segments: list[Segment], include_audio: bool) -> tuple[str, str, str | None]:
+def _build_filter_complex(
+    segments: list[Segment],
+    include_audio: bool,
+    *,
+    normalize_audio: bool = True,
+) -> tuple[str, str, str | None]:
     pieces: list[str] = []
     for index, segment in enumerate(segments):
         pieces.append(
@@ -273,7 +280,10 @@ def _build_filter_complex(segments: list[Segment], include_audio: bool) -> tuple
             "[vcat]scale=w=1920:h=1080:force_original_aspect_ratio=decrease,"
             "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,fps=60,format=yuv420p[vout]"
         )
-        pieces.append("[acat]loudnorm=I=-14:LRA=11:TP=-1.5[aout]")
+        if normalize_audio:
+            pieces.append(f"[acat]{LOUDNORM_FILTER}[aout]")
+        else:
+            pieces.append("[acat]anull[aout]")
         return ";".join(pieces), "[vout]", "[aout]"
 
     concat_inputs = "".join(f"[v{index}]" for index in range(len(segments)))
@@ -283,6 +293,33 @@ def _build_filter_complex(segments: list[Segment], include_audio: bool) -> tuple
         "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,fps=60,format=yuv420p[vout]"
     )
     return ";".join(pieces), "[vout]", None
+
+
+def _looks_like_loudnorm_nonfinite_error(error: subprocess.CalledProcessError) -> bool:
+    stderr = error.stderr or ""
+    stdout = error.stdout or ""
+    combined_output = f"{stderr}\n{stdout}"
+    return LOUDNORM_NONFINITE_ERROR in combined_output
+
+
+def _run_with_loudnorm_fallback(
+    command_with_loudnorm: list[str],
+    command_without_loudnorm: list[str] | None,
+) -> None:
+    if command_without_loudnorm is None:
+        _run_command(command_with_loudnorm)
+        return
+
+    try:
+        _run_command(command_with_loudnorm, capture_output=True)
+    except subprocess.CalledProcessError as error:
+        if not _looks_like_loudnorm_nonfinite_error(error):
+            raise
+        print(
+            "Warning: loudnorm failed due to non-finite audio values; retrying without loudness normalization.",
+            file=sys.stderr,
+        )
+        _run_command(command_without_loudnorm)
 
 
 def render_highlights(
@@ -300,7 +337,11 @@ def render_highlights(
         )
 
     include_audio = _has_audio_stream(input_path)
-    filter_graph, map_video, map_audio = _build_filter_complex(segments, include_audio)
+    filter_graph, map_video, map_audio = _build_filter_complex(
+        segments,
+        include_audio,
+        normalize_audio=True,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     command = [
@@ -343,7 +384,55 @@ def render_highlights(
         command.append("-an")
 
     command.append(str(output_path))
-    _run_command(command)
+
+    fallback_command: list[str] | None = None
+    if include_audio:
+        fallback_filter_graph, fallback_map_video, fallback_map_audio = _build_filter_complex(
+            segments,
+            include_audio=True,
+            normalize_audio=False,
+        )
+        fallback_command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-y",
+            "-i",
+            str(input_path),
+            "-filter_complex",
+            fallback_filter_graph,
+            "-map",
+            fallback_map_video,
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+        ]
+        if fallback_map_audio is not None:
+            fallback_command.extend(
+                [
+                    "-map",
+                    fallback_map_audio,
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "48000",
+                ]
+            )
+        else:
+            fallback_command.append("-an")
+        fallback_command.append(str(output_path))
+
+    _run_with_loudnorm_fallback(command, fallback_command)
 
 
 def transcode_full_match(
@@ -355,7 +444,7 @@ def transcode_full_match(
 ) -> None:
     has_audio = _has_audio_stream(input_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    command = [
+    base_command = [
         "ffmpeg",
         "-hide_banner",
         "-y",
@@ -373,25 +462,34 @@ def transcode_full_match(
         "-movflags",
         "+faststart",
     ]
+    command = base_command[:]
+    fallback_command: list[str] | None = None
     if has_audio:
+        audio_encode = [
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+        ]
         command.extend(
             [
                 "-af",
-                "loudnorm=I=-14:LRA=11:TP=-1.5",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-ac",
-                "2",
-                "-ar",
-                "48000",
+                LOUDNORM_FILTER,
             ]
         )
+        command.extend(audio_encode)
+        fallback_command = base_command + audio_encode
     else:
         command.append("-an")
+
     command.append(str(output_path))
-    _run_command(command)
+    if fallback_command is not None:
+        fallback_command.append(str(output_path))
+    _run_with_loudnorm_fallback(command, fallback_command)
 
 
 def analyze_recording(

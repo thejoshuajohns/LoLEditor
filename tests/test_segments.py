@@ -181,6 +181,75 @@ class SegmentLogicTests(unittest.TestCase):
 
             self.assertTrue(output_path.parent.is_dir())
 
+    def test_render_highlights_retries_without_loudnorm_on_non_finite_audio(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.mp4"
+            input_path.touch()
+            output_path = Path(temp_dir) / "rendered.mp4"
+
+            first_error = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["ffmpeg"],
+                stderr="Input contains (near) NaN/+-Inf",
+            )
+            success = subprocess.CompletedProcess(args=["ffmpeg"], returncode=0)
+
+            with (
+                patch("league_video_editor.cli.read_plan", return_value=[Segment(0.0, 1.0)]),
+                patch("league_video_editor.cli._has_audio_stream", return_value=True),
+                patch("league_video_editor.cli._run_command", side_effect=[first_error, success]) as run_command,
+            ):
+                render_highlights(
+                    input_path=input_path,
+                    plan_path=Path(temp_dir) / "plan.json",
+                    output_path=output_path,
+                    crf=20,
+                    preset="medium",
+                )
+
+            self.assertEqual(run_command.call_count, 2)
+            first_command = run_command.call_args_list[0].args[0]
+            first_kwargs = run_command.call_args_list[0].kwargs
+            second_command = run_command.call_args_list[1].args[0]
+            self.assertTrue(first_kwargs.get("capture_output", False))
+            self.assertIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(first_command))
+            self.assertNotIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(second_command))
+            self.assertIn("-c:a", second_command)
+
+    def test_transcode_full_match_retries_without_loudnorm_on_non_finite_audio(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.mp4"
+            input_path.touch()
+            output_path = Path(temp_dir) / "full.mp4"
+
+            first_error = subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["ffmpeg"],
+                stderr="Input contains (near) NaN/+-Inf",
+            )
+            success = subprocess.CompletedProcess(args=["ffmpeg"], returncode=0)
+
+            with (
+                patch("league_video_editor.cli._has_audio_stream", return_value=True),
+                patch("league_video_editor.cli._run_command", side_effect=[first_error, success]) as run_command,
+            ):
+                transcode_full_match(
+                    input_path=input_path,
+                    output_path=output_path,
+                    crf=20,
+                    preset="medium",
+                )
+
+            self.assertEqual(run_command.call_count, 2)
+            first_command = run_command.call_args_list[0].args[0]
+            first_kwargs = run_command.call_args_list[0].kwargs
+            second_command = run_command.call_args_list[1].args[0]
+            self.assertTrue(first_kwargs.get("capture_output", False))
+            self.assertIn("-af", first_command)
+            self.assertIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(first_command))
+            self.assertNotIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(second_command))
+            self.assertIn("-c:a", second_command)
+
     def test_detect_scene_events_propagates_command_failures(self) -> None:
         with patch(
             "league_video_editor.cli._run_command",
