@@ -4,8 +4,13 @@ Create YouTube-ready videos from your League of Legends OBS recordings.
 
 ## What this does
 
-- Detects high-action moments using scene-change analysis.
+- Detects high-action moments using scene-change + vision scoring.
 - Builds a highlight plan (`edit-plan.json`) that you can inspect/edit.
+- Anchors highlights to include:
+  - detected in-game spawn/start (skips client/loading when detected)
+  - end of the match (nexus finish coverage)
+- Uses a balanced target runtime by default (about 20 minutes) with fewer, longer cuts.
+- Prioritizes death moments by detecting gray-screen transitions and keeping lead-in context.
 - Renders a highlight montage (`highlights.mp4`) with:
   - 1080p output
   - 60 FPS
@@ -67,12 +72,17 @@ lol-video-editor analyze /path/to/recording.mp4 \
   --clip-before 10 \
   --clip-after 14 \
   --min-gap-seconds 20 \
-  --max-clips 24
+  --max-clips 24 \
+  --target-duration-seconds 1200 \
+  --intro-seconds 120 \
+  --outro-seconds 60
 ```
 
 Notes:
 - Lower `--scene-threshold` = more moments detected.
 - Higher `--min-gap-seconds` = fewer clips, less spam.
+- `--vision-scoring heuristic` (default) uses frame-motion + color heuristics to reduce idle/death-map segments while keeping lane context.
+- `--target-duration-seconds 0` means no cap (longer output with fewer cuts).
 
 ### 2) Render (from existing plan)
 
@@ -122,9 +132,8 @@ python3 -m unittest discover -s tests
 
 ## Limitations
 
-- Scene-change detection is generic; it is not game-event aware (kills/objectives).
+- Vision scoring is heuristic; it is not yet a true external ML model for kill/objective detection.
 - No GUI yet (CLI-only MVP).
 - Requires local `ffmpeg`.
 
 If you want, next step is a lightweight local web UI for timeline editing before render.
-
