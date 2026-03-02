@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -96,7 +97,7 @@ def detect_scene_events(input_path: Path, scene_threshold: float) -> list[float]
         "null",
         "-",
     ]
-    result = subprocess.run(cmd, text=True, capture_output=True)
+    result = _run_command(cmd, capture_output=True)
     output = (result.stderr or "") + "\n" + (result.stdout or "")
     matches = SCENE_PTS_PATTERN.findall(output)
     return sorted({float(value) for value in matches if float(value) >= 0.0})
@@ -148,7 +149,7 @@ def build_segments(
     min_gap_seconds: float,
     max_clips: int,
 ) -> tuple[list[Segment], bool]:
-    if duration_seconds <= 0:
+    if duration_seconds <= 0 or max_clips <= 0:
         return [], False
 
     filtered: list[float] = []
@@ -209,7 +210,11 @@ def write_plan(
         ],
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    try:
+        rendered_json = json.dumps(payload, indent=2, allow_nan=False)
+    except ValueError as error:
+        raise EditorError("Plan contains non-finite numeric values.") from error
+    output_path.write_text(rendered_json, encoding="utf-8")
 
 
 def read_plan(plan_path: Path) -> list[Segment]:
@@ -296,6 +301,7 @@ def render_highlights(
 
     include_audio = _has_audio_stream(input_path)
     filter_graph, map_video, map_audio = _build_filter_complex(segments, include_audio)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     command = [
         "ffmpeg",
@@ -348,6 +354,7 @@ def transcode_full_match(
     preset: str,
 ) -> None:
     has_audio = _has_audio_stream(input_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -438,6 +445,33 @@ def _validate_file(input_path: Path) -> None:
         raise EditorError(f"Input path is not a file: {input_path}")
 
 
+def _require_finite(option_name: str, value: float) -> None:
+    if not math.isfinite(value):
+        raise EditorError(f"--{option_name} must be a finite number.")
+
+
+def _validate_cli_options(args: argparse.Namespace) -> None:
+    if args.command in {"analyze", "auto"}:
+        _require_finite("scene-threshold", args.scene_threshold)
+        if not 0.0 <= args.scene_threshold <= 1.0:
+            raise EditorError("--scene-threshold must be between 0.0 and 1.0.")
+
+        for option_name, option_value in (
+            ("clip-before", args.clip_before),
+            ("clip-after", args.clip_after),
+            ("min-gap-seconds", args.min_gap_seconds),
+        ):
+            _require_finite(option_name, option_value)
+            if option_value < 0:
+                raise EditorError(f"--{option_name} must be >= 0.")
+
+        if args.max_clips < 1:
+            raise EditorError("--max-clips must be >= 1.")
+
+    if args.command in {"render", "auto", "full"} and not 0 <= args.crf <= 51:
+        raise EditorError("--crf must be between 0 and 51.")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lol-video-editor",
@@ -516,6 +550,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        _validate_cli_options(args)
         _require_binary("ffmpeg")
         _require_binary("ffprobe")
         _validate_file(args.input)
