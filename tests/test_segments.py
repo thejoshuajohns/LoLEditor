@@ -9,9 +9,13 @@ from unittest.mock import patch
 from league_video_editor.cli import (
     EditorError,
     Segment,
+    _build_filter_complex,
+    _extract_loudnorm_json,
     _looks_like_loudnorm_nonfinite_error,
     _probe_duration_seconds,
     _validate_cli_options,
+    _video_codec_args,
+    _video_postprocess_filter,
     build_segments,
     detect_scene_events,
     merge_segments,
@@ -168,13 +172,36 @@ class SegmentLogicTests(unittest.TestCase):
             min_gap_seconds=18.0,
             max_clips=0,
             crf=20,
+            crossfade_seconds=0.0,
+            audio_fade_seconds=0.03,
+            video_encoder="libx264",
         )
         with self.assertRaisesRegex(EditorError, "scene-threshold must be between 0.0 and 1.0"):
             _validate_cli_options(args)
 
     def test_validate_cli_options_rejects_crf_out_of_range(self) -> None:
-        args = argparse.Namespace(command="full", crf=52)
+        args = argparse.Namespace(command="full", crf=52, video_encoder="libx264")
         with self.assertRaisesRegex(EditorError, "crf must be between 0 and 51"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_negative_crossfade(self) -> None:
+        args = argparse.Namespace(
+            command="render",
+            crf=20,
+            crossfade_seconds=-0.1,
+            audio_fade_seconds=0.03,
+            video_encoder="libx264",
+        )
+        with self.assertRaisesRegex(EditorError, "crossfade-seconds"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_invalid_video_encoder(self) -> None:
+        args = argparse.Namespace(
+            command="full",
+            crf=20,
+            video_encoder="not-real",
+        )
+        with self.assertRaisesRegex(EditorError, "video-encoder must be one of"):
             _validate_cli_options(args)
 
     def test_render_highlights_creates_output_directory(self) -> None:
@@ -197,6 +224,11 @@ class SegmentLogicTests(unittest.TestCase):
                     output_path=output_path,
                     crf=20,
                     preset="medium",
+                    video_encoder="libx264",
+                    allow_upscale=False,
+                    crossfade_seconds=0.0,
+                    audio_fade_seconds=0.03,
+                    two_pass_loudnorm=False,
                 )
 
             self.assertTrue(output_path.parent.is_dir())
@@ -219,6 +251,9 @@ class SegmentLogicTests(unittest.TestCase):
                     output_path=output_path,
                     crf=20,
                     preset="medium",
+                    video_encoder="libx264",
+                    allow_upscale=False,
+                    two_pass_loudnorm=False,
                 )
 
             self.assertTrue(output_path.parent.is_dir())
@@ -247,6 +282,11 @@ class SegmentLogicTests(unittest.TestCase):
                     output_path=output_path,
                     crf=20,
                     preset="medium",
+                    video_encoder="libx264",
+                    allow_upscale=False,
+                    crossfade_seconds=0.0,
+                    audio_fade_seconds=0.03,
+                    two_pass_loudnorm=False,
                 )
 
             self.assertEqual(run_command.call_count, 2)
@@ -280,6 +320,9 @@ class SegmentLogicTests(unittest.TestCase):
                     output_path=output_path,
                     crf=20,
                     preset="medium",
+                    video_encoder="libx264",
+                    allow_upscale=False,
+                    two_pass_loudnorm=False,
                 )
 
             self.assertEqual(run_command.call_count, 2)
@@ -291,6 +334,100 @@ class SegmentLogicTests(unittest.TestCase):
             self.assertIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(first_command))
             self.assertNotIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(second_command))
             self.assertIn("-c:a", second_command)
+
+    def test_render_highlights_uses_two_pass_loudnorm_when_enabled(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.mp4"
+            input_path.touch()
+            output_path = Path(temp_dir) / "rendered.mp4"
+            analysis_output = """
+            {
+              "input_i": "-23.1",
+              "input_tp": "-1.2",
+              "input_lra": "5.0",
+              "input_thresh": "-34.0",
+              "target_offset": "0.5"
+            }
+            """
+            analysis_result = subprocess.CompletedProcess(
+                args=["ffmpeg"], returncode=0, stdout="", stderr=analysis_output
+            )
+            encode_result = subprocess.CompletedProcess(
+                args=["ffmpeg"], returncode=0, stdout="", stderr=""
+            )
+
+            with (
+                patch("league_video_editor.cli.read_plan", return_value=[Segment(0.0, 1.0)]),
+                patch("league_video_editor.cli._has_audio_stream", return_value=True),
+                patch(
+                    "league_video_editor.cli._run_command",
+                    side_effect=[analysis_result, encode_result],
+                ) as run_command,
+            ):
+                render_highlights(
+                    input_path=input_path,
+                    plan_path=Path(temp_dir) / "plan.json",
+                    output_path=output_path,
+                    crf=20,
+                    preset="medium",
+                    video_encoder="libx264",
+                    allow_upscale=False,
+                    crossfade_seconds=0.0,
+                    audio_fade_seconds=0.03,
+                    two_pass_loudnorm=True,
+                )
+
+            self.assertEqual(run_command.call_count, 2)
+            analysis_command = run_command.call_args_list[0].args[0]
+            encode_command = run_command.call_args_list[1].args[0]
+            self.assertIn("print_format=json", " ".join(analysis_command))
+            self.assertIn("measured_I=", " ".join(encode_command))
+
+    def test_build_filter_complex_supports_crossfade_and_audio_fades(self) -> None:
+        segments = [Segment(0.0, 5.0), Segment(8.0, 12.0)]
+        filter_graph, map_video, map_audio = _build_filter_complex(
+            segments,
+            include_audio=True,
+            include_video=True,
+            allow_upscale=False,
+            crossfade_seconds=0.2,
+            audio_fade_seconds=0.05,
+        )
+        self.assertEqual(map_video, "[vout]")
+        self.assertEqual(map_audio, "[aout]")
+        self.assertIn("xfade=transition=fade", filter_graph)
+        self.assertIn("acrossfade=d=0.200", filter_graph)
+        self.assertIn("afade=t=in:st=0:d=0.050", filter_graph)
+
+    def test_video_postprocess_filter_disables_upscale_by_default(self) -> None:
+        filter_text = _video_postprocess_filter(allow_upscale=False)
+        self.assertIn("if(gt(iw,1920),1920,iw)", filter_text)
+        self.assertIn("if(gt(ih,1080),1080,ih)", filter_text)
+
+    def test_video_codec_args_switch_for_hardware_encoder(self) -> None:
+        args = _video_codec_args(video_encoder="h264_videotoolbox", crf=20, preset="medium")
+        self.assertIn("h264_videotoolbox", args)
+        self.assertIn("-b:v", args)
+        self.assertNotIn("-crf", args)
+
+    def test_extract_loudnorm_json_parses_required_fields(self) -> None:
+        data = _extract_loudnorm_json(
+            """
+            random logs
+            {
+              "input_i": "-20.0",
+              "input_tp": "-2.1",
+              "input_lra": "6.5",
+              "input_thresh": "-31.0",
+              "target_offset": "0.1"
+            }
+            """
+        )
+        self.assertAlmostEqual(data["measured_I"], -20.0)
+        self.assertAlmostEqual(data["measured_TP"], -2.1)
+        self.assertAlmostEqual(data["measured_LRA"], 6.5)
+        self.assertAlmostEqual(data["measured_thresh"], -31.0)
+        self.assertAlmostEqual(data["offset"], 0.1)
 
     def test_loudnorm_error_matcher_accepts_variant_message(self) -> None:
         error = subprocess.CalledProcessError(
