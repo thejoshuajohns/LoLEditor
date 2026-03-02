@@ -10,9 +10,14 @@ from league_video_editor.cli import (
     EditorError,
     Segment,
     VisionWindow,
+    analyze_watchability,
     _build_filter_complex,
+    _build_watchability_report,
     _compute_vision_window_scores,
+    _detect_combat_cues,
     _detect_death_cues,
+    _detect_watchability_crop_filter,
+    _estimate_render_duration,
     _extract_loudnorm_json,
     _looks_like_loudnorm_nonfinite_error,
     _probe_duration_seconds,
@@ -21,6 +26,7 @@ from league_video_editor.cli import (
     _video_postprocess_filter,
     build_segments,
     detect_scene_events,
+    detect_scene_events_adaptive,
     merge_segments,
     read_plan,
     render_highlights,
@@ -45,6 +51,13 @@ class SegmentLogicTests(unittest.TestCase):
             ]
         )
         self.assertEqual(merged, [Segment(0.0, 20.0), Segment(25.0, 30.0)])
+
+    def test_estimate_render_duration_with_crossfade(self) -> None:
+        duration = _estimate_render_duration(
+            [Segment(0.0, 12.0), Segment(20.0, 35.0), Segment(60.0, 72.0)],
+            crossfade_seconds=1.0,
+        )
+        self.assertAlmostEqual(duration, 37.0)
 
     def test_build_segments_uses_fallback_when_no_events(self) -> None:
         segments, used_fallback = build_segments(
@@ -183,6 +196,20 @@ class SegmentLogicTests(unittest.TestCase):
         self.assertLess(cues[0], 40.0)
         self.assertLess(cues[1], 100.0)
 
+    def test_detect_combat_cues_finds_high_activity_spikes(self) -> None:
+        windows = [
+            VisionWindow(start=0.0, end=20.0, score=0.30, motion=3.0, saturation=30.0, scene_density=0.04),
+            VisionWindow(start=20.0, end=40.0, score=0.85, motion=12.0, saturation=42.0, scene_density=0.26),
+            VisionWindow(start=40.0, end=60.0, score=0.72, motion=9.0, saturation=40.0, scene_density=0.19),
+            VisionWindow(start=60.0, end=80.0, score=0.28, motion=3.2, saturation=28.0, scene_density=0.03),
+            VisionWindow(start=80.0, end=100.0, score=0.82, motion=11.0, saturation=43.0, scene_density=0.24),
+            VisionWindow(start=100.0, end=120.0, score=0.75, motion=9.2, saturation=41.0, scene_density=0.18),
+        ]
+        cues = _detect_combat_cues(windows, min_spacing_seconds=20.0)
+        self.assertGreaterEqual(len(cues), 2)
+        self.assertLess(cues[0], 20.0)
+        self.assertLess(cues[1], 80.0)
+
     def test_build_segments_prioritizes_detected_death_cues(self) -> None:
         windows = [
             VisionWindow(start=100.0, end=120.0, score=0.75, motion=9.0, saturation=46.0, scene_density=0.25),
@@ -205,6 +232,125 @@ class SegmentLogicTests(unittest.TestCase):
             vision_windows=windows,
         )
         self.assertTrue(any(segment.start <= 135.0 <= segment.end for segment in segments))
+
+    def test_build_segments_samples_forced_cues_across_timeline(self) -> None:
+        with (
+            patch(
+                "league_video_editor.cli._detect_death_cues",
+                return_value=[100.0, 180.0, 260.0, 340.0, 420.0, 560.0],
+            ),
+            patch("league_video_editor.cli._detect_combat_cues", return_value=[]),
+        ):
+            segments, _ = build_segments(
+                [],
+                duration_seconds=640.0,
+                clip_before=8.0,
+                clip_after=12.0,
+                min_gap_seconds=20.0,
+                max_clips=3,
+                target_duration_seconds=120.0,
+                intro_seconds=0.0,
+                outro_seconds=0.0,
+                vision_windows=[],
+            )
+        self.assertEqual(len(segments), 3)
+        self.assertTrue(any(segment.start <= 100.0 <= segment.end for segment in segments))
+        self.assertTrue(any(segment.start <= 560.0 <= segment.end for segment in segments))
+
+    def test_build_watchability_report_outputs_score_and_recommendations(self) -> None:
+        vision_windows = [
+            VisionWindow(start=0.0, end=12.0, score=0.15, motion=1.2, saturation=10.0, scene_density=0.01),
+            VisionWindow(start=12.0, end=24.0, score=0.25, motion=2.0, saturation=12.0, scene_density=0.03),
+            VisionWindow(start=24.0, end=36.0, score=0.65, motion=8.5, saturation=35.0, scene_density=0.18),
+            VisionWindow(start=36.0, end=48.0, score=0.80, motion=10.2, saturation=40.0, scene_density=0.22),
+            VisionWindow(start=48.0, end=60.0, score=0.20, motion=1.5, saturation=9.0, scene_density=0.02),
+        ]
+        report = _build_watchability_report(
+            duration_seconds=60.0,
+            events=[8.0, 22.0, 37.0],
+            vision_windows=vision_windows,
+            scene_threshold_used=0.35,
+        )
+        self.assertIn("watchability_score", report)
+        self.assertIn("rating", report)
+        self.assertIn("scene_threshold_used", report)
+        self.assertIn("recommendations", report)
+        self.assertGreaterEqual(float(report["watchability_score"]), 0.0)
+        self.assertLessEqual(float(report["watchability_score"]), 100.0)
+
+    def test_analyze_watchability_emits_overall_loading_bar(self) -> None:
+        vision_windows = [
+            VisionWindow(start=0.0, end=12.0, score=0.6, motion=8.0, saturation=30.0, scene_density=0.1),
+            VisionWindow(start=12.0, end=24.0, score=0.7, motion=9.0, saturation=32.0, scene_density=0.12),
+        ]
+        with (
+            patch("league_video_editor.cli._probe_duration_seconds", return_value=24.0),
+            patch(
+                "league_video_editor.cli.detect_scene_events_adaptive",
+                return_value=([4.0, 10.0], 0.35),
+            ) as detect_scene_events,
+            patch("league_video_editor.cli.score_vision_activity", return_value=vision_windows) as score_vision_activity,
+            patch("league_video_editor.cli.print") as mocked_print,
+        ):
+            report = analyze_watchability(
+                input_path=Path("input.mp4"),
+                scene_threshold=0.35,
+                vision_sample_fps=1.0,
+                vision_window_seconds=12.0,
+                vision_step_seconds=6.0,
+            )
+
+        self.assertIn("watchability_score", report)
+        self.assertEqual(detect_scene_events.call_count, 1)
+        self.assertEqual(score_vision_activity.call_count, 1)
+
+        detect_kwargs = detect_scene_events.call_args.kwargs
+        self.assertTrue(detect_kwargs["show_progress"])
+        self.assertIsNone(detect_kwargs["progress_label"])
+        self.assertIsNotNone(detect_kwargs["progress_callback"])
+
+        score_kwargs = score_vision_activity.call_args.kwargs
+        self.assertTrue(score_kwargs["show_progress"])
+        self.assertIsNone(score_kwargs["progress_label"])
+        self.assertIsNotNone(score_kwargs["progress_callback"])
+
+        printed_lines = [str(call.args[0]) for call in mocked_print.call_args_list if call.args]
+        self.assertTrue(any("Analyzing watchability" in line for line in printed_lines))
+        self.assertTrue(any("100.0%" in line for line in printed_lines))
+
+    def test_analyze_watchability_can_disable_loading_bar(self) -> None:
+        vision_windows = [
+            VisionWindow(start=0.0, end=12.0, score=0.6, motion=8.0, saturation=30.0, scene_density=0.1),
+        ]
+        with (
+            patch("league_video_editor.cli._probe_duration_seconds", return_value=12.0),
+            patch(
+                "league_video_editor.cli.detect_scene_events_adaptive",
+                return_value=([4.0], 0.35),
+            ) as detect_scene_events,
+            patch("league_video_editor.cli.score_vision_activity", return_value=vision_windows) as score_vision_activity,
+            patch("league_video_editor.cli.print") as mocked_print,
+        ):
+            analyze_watchability(
+                input_path=Path("input.mp4"),
+                scene_threshold=0.35,
+                vision_sample_fps=1.0,
+                vision_window_seconds=12.0,
+                vision_step_seconds=6.0,
+                show_progress=False,
+            )
+
+        detect_kwargs = detect_scene_events.call_args.kwargs
+        self.assertFalse(detect_kwargs["show_progress"])
+        self.assertEqual(detect_kwargs["progress_label"], "Analyzing scenes")
+        self.assertIsNone(detect_kwargs["progress_callback"])
+
+        score_kwargs = score_vision_activity.call_args.kwargs
+        self.assertFalse(score_kwargs["show_progress"])
+        self.assertEqual(score_kwargs["progress_label"], "Scoring gameplay")
+        self.assertIsNone(score_kwargs["progress_callback"])
+
+        self.assertFalse(mocked_print.called)
 
     def test_build_segments_with_zero_max_clips_returns_empty(self) -> None:
         segments, used_fallback = build_segments(
@@ -301,6 +447,26 @@ class SegmentLogicTests(unittest.TestCase):
             with self.assertRaisesRegex(EditorError, "valid finite value"):
                 _probe_duration_seconds(Path("input.mp4"))
 
+    def test_detect_watchability_crop_filter_uses_most_common_crop(self) -> None:
+        crop_output = "\n".join(
+            [
+                "crop=1920:1080:0:0",
+                "crop=1920:1080:0:0",
+                "crop=1880:1040:20:20",
+            ]
+        )
+        with patch(
+            "league_video_editor.cli._run_command",
+            return_value=subprocess.CompletedProcess(
+                args=["ffmpeg"], returncode=0, stdout="", stderr=crop_output
+            ),
+        ):
+            crop_filter = _detect_watchability_crop_filter(
+                Path("input.mp4"),
+                duration_seconds=120.0,
+            )
+        self.assertEqual(crop_filter, "crop=1920:1080:0:0")
+
     def test_validate_cli_options_rejects_non_finite_scene_threshold(self) -> None:
         args = argparse.Namespace(
             command="analyze",
@@ -310,6 +476,7 @@ class SegmentLogicTests(unittest.TestCase):
             min_gap_seconds=18.0,
             max_clips=20,
             target_duration_seconds=600.0,
+            target_duration_ratio=0.6,
             intro_seconds=45.0,
             outro_seconds=60.0,
         )
@@ -325,6 +492,7 @@ class SegmentLogicTests(unittest.TestCase):
             min_gap_seconds=18.0,
             max_clips=0,
             target_duration_seconds=600.0,
+            target_duration_ratio=0.6,
             intro_seconds=45.0,
             outro_seconds=60.0,
             vision_scoring="heuristic",
@@ -349,6 +517,7 @@ class SegmentLogicTests(unittest.TestCase):
             min_gap_seconds=18.0,
             max_clips=20,
             target_duration_seconds=600.0,
+            target_duration_ratio=0.6,
             intro_seconds=45.0,
             outro_seconds=60.0,
             vision_scoring="heuristic",
@@ -368,6 +537,7 @@ class SegmentLogicTests(unittest.TestCase):
             min_gap_seconds=18.0,
             max_clips=20,
             target_duration_seconds=-1.0,
+            target_duration_ratio=0.6,
             intro_seconds=45.0,
             outro_seconds=60.0,
             vision_scoring="heuristic",
@@ -376,6 +546,37 @@ class SegmentLogicTests(unittest.TestCase):
             vision_step_seconds=6.0,
         )
         with self.assertRaisesRegex(EditorError, "target-duration-seconds"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_invalid_target_duration_ratio(self) -> None:
+        args = argparse.Namespace(
+            command="analyze",
+            scene_threshold=0.35,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=20,
+            target_duration_seconds=0.0,
+            target_duration_ratio=1.2,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+            vision_scoring="heuristic",
+            vision_sample_fps=1.0,
+            vision_window_seconds=12.0,
+            vision_step_seconds=6.0,
+        )
+        with self.assertRaisesRegex(EditorError, "target-duration-ratio"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_invalid_watchability_options(self) -> None:
+        args = argparse.Namespace(
+            command="watchability",
+            scene_threshold=0.35,
+            vision_sample_fps=1.0,
+            vision_window_seconds=0.0,
+            vision_step_seconds=6.0,
+        )
+        with self.assertRaisesRegex(EditorError, "vision-window-seconds"):
             _validate_cli_options(args)
 
     def test_validate_cli_options_rejects_crf_out_of_range(self) -> None:
@@ -487,7 +688,7 @@ class SegmentLogicTests(unittest.TestCase):
                 patch("league_video_editor.cli._has_audio_stream", return_value=True),
                 patch(
                     "league_video_editor.cli._run_command_with_stderr_tail",
-                    side_effect=[first_error],
+                    side_effect=[first_error, success],
                 ) as run_with_stderr_tail,
                 patch(
                     "league_video_editor.cli._run_command",
@@ -507,10 +708,10 @@ class SegmentLogicTests(unittest.TestCase):
                     two_pass_loudnorm=False,
                 )
 
-            self.assertEqual(run_with_stderr_tail.call_count, 1)
-            self.assertEqual(run_command.call_count, 1)
+            self.assertEqual(run_with_stderr_tail.call_count, 2)
+            self.assertEqual(run_command.call_count, 0)
             first_command = run_with_stderr_tail.call_args_list[0].args[0]
-            second_command = run_command.call_args_list[0].args[0]
+            second_command = run_with_stderr_tail.call_args_list[1].args[0]
             self.assertIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(first_command))
             self.assertNotIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(second_command))
             self.assertIn("-c:a", second_command)
@@ -532,7 +733,7 @@ class SegmentLogicTests(unittest.TestCase):
                 patch("league_video_editor.cli._has_audio_stream", return_value=True),
                 patch(
                     "league_video_editor.cli._run_command_with_stderr_tail",
-                    side_effect=[first_error],
+                    side_effect=[first_error, success],
                 ) as run_with_stderr_tail,
                 patch(
                     "league_video_editor.cli._run_command",
@@ -549,10 +750,10 @@ class SegmentLogicTests(unittest.TestCase):
                     two_pass_loudnorm=False,
                 )
 
-            self.assertEqual(run_with_stderr_tail.call_count, 1)
+            self.assertEqual(run_with_stderr_tail.call_count, 2)
             self.assertEqual(run_command.call_count, 1)
             first_command = run_with_stderr_tail.call_args_list[0].args[0]
-            second_command = run_command.call_args_list[0].args[0]
+            second_command = run_with_stderr_tail.call_args_list[1].args[0]
             self.assertIn("-af", first_command)
             self.assertIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(first_command))
             self.assertNotIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(second_command))
@@ -696,6 +897,21 @@ class SegmentLogicTests(unittest.TestCase):
         ):
             with self.assertRaises(subprocess.CalledProcessError):
                 detect_scene_events(Path("input.mp4"), scene_threshold=0.35)
+
+    def test_detect_scene_events_adaptive_falls_back_to_lower_threshold(self) -> None:
+        with patch(
+            "league_video_editor.cli.detect_scene_events",
+            side_effect=[[], [2.0, 8.0, 10.5]],
+        ) as detect_scene_events_mock:
+            events, threshold = detect_scene_events_adaptive(
+                Path("input.mp4"),
+                scene_threshold=0.35,
+                duration_seconds=120.0,
+                show_progress=False,
+            )
+        self.assertEqual(events, [2.0, 8.0, 10.5])
+        self.assertLess(threshold, 0.35)
+        self.assertEqual(detect_scene_events_mock.call_count, 2)
 
 
 if __name__ == "__main__":
