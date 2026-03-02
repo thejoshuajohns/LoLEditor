@@ -9,7 +9,10 @@ from unittest.mock import patch
 from league_video_editor.cli import (
     EditorError,
     Segment,
+    VisionWindow,
     _build_filter_complex,
+    _compute_vision_window_scores,
+    _detect_death_cues,
     _extract_loudnorm_json,
     _looks_like_loudnorm_nonfinite_error,
     _probe_duration_seconds,
@@ -93,6 +96,115 @@ class SegmentLogicTests(unittest.TestCase):
         self.assertFalse(used_fallback)
         total_duration = sum(segment.duration for segment in segments)
         self.assertGreaterEqual(total_duration, 560.0)
+
+    def test_build_segments_uncapped_target_produces_longer_output(self) -> None:
+        events = [float(value) for value in range(60, 1140, 24)]
+        capped_segments, _ = build_segments(
+            events,
+            duration_seconds=1200.0,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=14,
+            target_duration_seconds=600.0,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+        )
+        uncapped_segments, _ = build_segments(
+            events,
+            duration_seconds=1200.0,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=14,
+            target_duration_seconds=0.0,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+        )
+        self.assertGreater(
+            sum(segment.duration for segment in uncapped_segments),
+            sum(segment.duration for segment in capped_segments),
+        )
+
+    def test_compute_vision_window_scores_penalizes_idle_and_low_saturation(self) -> None:
+        frame_samples: list[tuple[float, float, float]] = []
+        for second in range(0, 30):
+            frame_samples.append((float(second), 10.0, 70.0))
+        for second in range(30, 60):
+            frame_samples.append((float(second), 0.5, 8.0))
+
+        windows = _compute_vision_window_scores(
+            frame_samples=frame_samples,
+            events=[5.0, 10.0, 18.0, 22.0],
+            duration_seconds=60.0,
+            window_seconds=10.0,
+            step_seconds=10.0,
+        )
+        self.assertEqual(len(windows), 6)
+        self.assertGreater(windows[0].score, windows[-1].score)
+        self.assertGreater(windows[1].score, windows[4].score)
+
+    def test_build_segments_uses_vision_windows_when_available(self) -> None:
+        windows = [
+            VisionWindow(start=160.0, end=220.0, score=0.98, motion=12.0, saturation=60.0, scene_density=0.2),
+            VisionWindow(start=230.0, end=290.0, score=0.94, motion=10.0, saturation=58.0, scene_density=0.18),
+            VisionWindow(start=600.0, end=650.0, score=0.10, motion=1.0, saturation=10.0, scene_density=0.01),
+        ]
+        segments, _ = build_segments(
+            [90.0, 300.0, 610.0, 900.0],
+            duration_seconds=1200.0,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=4,
+            target_duration_seconds=360.0,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+            vision_windows=windows,
+        )
+        self.assertGreaterEqual(segments[0].start, 150.0)
+        self.assertLessEqual(segments[0].start, 170.0)
+        middle_segments = [segment for segment in segments if segment.start > segments[0].end and segment.end < 1140.0]
+        self.assertGreaterEqual(len(middle_segments), 1)
+        self.assertTrue(any(segment.start <= 250.0 <= segment.end for segment in middle_segments))
+
+    def test_detect_death_cues_finds_gray_screen_transitions(self) -> None:
+        windows = [
+            VisionWindow(start=0.0, end=20.0, score=0.65, motion=8.0, saturation=45.0, scene_density=0.2),
+            VisionWindow(start=20.0, end=40.0, score=0.62, motion=7.5, saturation=44.0, scene_density=0.2),
+            VisionWindow(start=40.0, end=60.0, score=0.22, motion=2.4, saturation=9.0, scene_density=0.03),
+            VisionWindow(start=60.0, end=80.0, score=0.20, motion=2.1, saturation=8.5, scene_density=0.02),
+            VisionWindow(start=80.0, end=100.0, score=0.60, motion=7.2, saturation=42.0, scene_density=0.18),
+            VisionWindow(start=100.0, end=120.0, score=0.21, motion=2.0, saturation=8.0, scene_density=0.02),
+            VisionWindow(start=120.0, end=140.0, score=0.19, motion=1.8, saturation=7.5, scene_density=0.02),
+        ]
+        cues = _detect_death_cues(windows, min_spacing_seconds=20.0)
+        self.assertEqual(len(cues), 2)
+        self.assertLess(cues[0], 40.0)
+        self.assertLess(cues[1], 100.0)
+
+    def test_build_segments_prioritizes_detected_death_cues(self) -> None:
+        windows = [
+            VisionWindow(start=100.0, end=120.0, score=0.75, motion=9.0, saturation=46.0, scene_density=0.25),
+            VisionWindow(start=120.0, end=140.0, score=0.70, motion=8.2, saturation=45.0, scene_density=0.2),
+            VisionWindow(start=140.0, end=160.0, score=0.22, motion=2.2, saturation=9.0, scene_density=0.02),
+            VisionWindow(start=160.0, end=180.0, score=0.18, motion=1.9, saturation=8.0, scene_density=0.02),
+            VisionWindow(start=220.0, end=240.0, score=0.60, motion=6.8, saturation=40.0, scene_density=0.15),
+            VisionWindow(start=240.0, end=260.0, score=0.58, motion=6.5, saturation=38.0, scene_density=0.15),
+        ]
+        segments, _ = build_segments(
+            [130.0, 235.0],
+            duration_seconds=500.0,
+            clip_before=10.0,
+            clip_after=12.0,
+            min_gap_seconds=20.0,
+            max_clips=2,
+            target_duration_seconds=180.0,
+            intro_seconds=0.0,
+            outro_seconds=30.0,
+            vision_windows=windows,
+        )
+        self.assertTrue(any(segment.start <= 135.0 <= segment.end for segment in segments))
 
     def test_build_segments_with_zero_max_clips_returns_empty(self) -> None:
         segments, used_fallback = build_segments(
@@ -215,6 +327,10 @@ class SegmentLogicTests(unittest.TestCase):
             target_duration_seconds=600.0,
             intro_seconds=45.0,
             outro_seconds=60.0,
+            vision_scoring="heuristic",
+            vision_sample_fps=1.0,
+            vision_window_seconds=12.0,
+            vision_step_seconds=6.0,
             crf=20,
             crossfade_seconds=0.0,
             audio_fade_seconds=0.03,
@@ -222,6 +338,44 @@ class SegmentLogicTests(unittest.TestCase):
             preset="medium",
         )
         with self.assertRaisesRegex(EditorError, "scene-threshold must be between 0.0 and 1.0"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_invalid_vision_sampling_options(self) -> None:
+        args = argparse.Namespace(
+            command="analyze",
+            scene_threshold=0.35,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=20,
+            target_duration_seconds=600.0,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+            vision_scoring="heuristic",
+            vision_sample_fps=0.0,
+            vision_window_seconds=12.0,
+            vision_step_seconds=6.0,
+        )
+        with self.assertRaisesRegex(EditorError, "vision-sample-fps"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_negative_target_duration(self) -> None:
+        args = argparse.Namespace(
+            command="analyze",
+            scene_threshold=0.35,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=20,
+            target_duration_seconds=-1.0,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+            vision_scoring="heuristic",
+            vision_sample_fps=1.0,
+            vision_window_seconds=12.0,
+            vision_step_seconds=6.0,
+        )
+        with self.assertRaisesRegex(EditorError, "target-duration-seconds"):
             _validate_cli_options(args)
 
     def test_validate_cli_options_rejects_crf_out_of_range(self) -> None:
