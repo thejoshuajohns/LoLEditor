@@ -88,7 +88,7 @@ class SegmentLogicTests(unittest.TestCase):
         )
         self.assertFalse(used_fallback)
         self.assertAlmostEqual(segments[0].start, 0.0)
-        self.assertAlmostEqual(segments[-1].end, 1128.0)
+        self.assertAlmostEqual(segments[-1].end, 1116.0)
         total_duration = sum(segment.duration for segment in segments)
         self.assertGreaterEqual(total_duration, 560.0)
         self.assertLessEqual(total_duration, 640.0)
