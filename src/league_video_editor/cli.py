@@ -975,7 +975,6 @@ def _derive_outro_segment(
     *,
     duration_seconds: float,
     events: list[float],
-    clip_after: float,
     outro_seconds: float,
 ) -> Segment | None:
     if duration_seconds <= 0 or outro_seconds <= 0:
@@ -985,7 +984,9 @@ def _derive_outro_segment(
     if events:
         last_event = max(events)
         if duration_seconds - last_event <= 180.0:
-            likely_finish = min(duration_seconds, last_event + max(clip_after, 12.0))
+            # Treat the last near-end scene event as the terminal in-game moment.
+            # This avoids trailing into post-game screens after nexus destruction.
+            likely_finish = min(duration_seconds, max(0.0, last_event))
 
     outro_end = max(0.0, likely_finish)
     outro_start = max(0.0, outro_end - outro_seconds)
@@ -1021,7 +1022,6 @@ def build_segments(
     outro_segment = _derive_outro_segment(
         duration_seconds=duration_seconds,
         events=events,
-        clip_after=clip_after,
         outro_seconds=max(0.0, outro_seconds),
     )
 
