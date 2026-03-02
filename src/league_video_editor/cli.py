@@ -1,22 +1,29 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 
 SCENE_PTS_PATTERN = re.compile(r"pts_time:(-?\d+(?:\.\d+)?)")
+FFMPEG_TIME_PATTERN = re.compile(r"time=(\d{2}:\d{2}:\d{2}(?:\.\d+)?)")
 LOUDNORM_FILTER = "loudnorm=I=-14:LRA=11:TP=-1.5"
 LOUDNORM_NONFINITE_PATTERN = re.compile(r"input contains.*nan.*inf", re.IGNORECASE | re.DOTALL)
 LOUDNORM_ANALYSIS_FILTER = f"{LOUDNORM_FILTER}:print_format=json"
 VIDEO_ENCODERS = ("libx264", "h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf")
+DEFAULT_TARGET_DURATION_SECONDS = 600.0
+DEFAULT_INTRO_SECONDS = 45.0
+DEFAULT_OUTRO_SECONDS = 60.0
 
 
 class EditorError(RuntimeError):
@@ -135,6 +142,85 @@ def _probe_duration_seconds(input_path: Path) -> float:
     return duration
 
 
+def _parse_ffmpeg_clock_to_seconds(clock: str) -> float:
+    parts = clock.split(":")
+    if len(parts) != 3:
+        return 0.0
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+    except ValueError:
+        return 0.0
+    return max(0.0, hours * 3600 + minutes * 60 + seconds)
+
+
+def _render_progress_line(label: str, ratio: float, *, width: int = 28) -> str:
+    clamped = min(1.0, max(0.0, ratio))
+    filled = int(clamped * width)
+    bar = "#" * filled + "-" * (width - filled)
+    return f"\r{label}: [{bar}] {clamped * 100:5.1f}%"
+
+
+def _detect_scene_events_with_progress(
+    cmd: list[str],
+    *,
+    duration_seconds: float,
+) -> list[float]:
+    events: set[float] = set()
+    last_output_ratio = -1.0
+    stderr_tail: deque[str] = deque(maxlen=120)
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        assert process.stderr is not None
+        for line in process.stderr:
+            stderr_tail.append(line)
+            for value in SCENE_PTS_PATTERN.findall(line):
+                try:
+                    event_time = float(value)
+                except ValueError:
+                    continue
+                if event_time >= 0:
+                    events.add(event_time)
+
+            time_match = FFMPEG_TIME_PATTERN.search(line)
+            if time_match and duration_seconds > 0:
+                current_seconds = _parse_ffmpeg_clock_to_seconds(time_match.group(1))
+                progress_ratio = min(1.0, current_seconds / duration_seconds)
+                if progress_ratio >= last_output_ratio + 0.01 or progress_ratio >= 1.0:
+                    print(
+                        _render_progress_line("Analyzing scenes", progress_ratio),
+                        end="",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    last_output_ratio = progress_ratio
+
+        return_code = process.wait()
+        if duration_seconds > 0:
+            print(
+                _render_progress_line("Analyzing scenes", 1.0),
+                file=sys.stderr,
+                flush=True,
+            )
+        if return_code != 0:
+            raise subprocess.CalledProcessError(
+                return_code,
+                cmd,
+                stderr="".join(stderr_tail),
+            )
+        return sorted(events)
+    except KeyboardInterrupt:
+        process.terminate()
+        raise
+
+
 def _has_audio_stream(input_path: Path) -> bool:
     result = _run_command(
         [
@@ -154,7 +240,13 @@ def _has_audio_stream(input_path: Path) -> bool:
     return bool(result.stdout.strip())
 
 
-def detect_scene_events(input_path: Path, scene_threshold: float) -> list[float]:
+def detect_scene_events(
+    input_path: Path,
+    scene_threshold: float,
+    *,
+    duration_seconds: float | None = None,
+    show_progress: bool = False,
+) -> list[float]:
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -167,6 +259,14 @@ def detect_scene_events(input_path: Path, scene_threshold: float) -> list[float]
         "null",
         "-",
     ]
+    if show_progress:
+        if duration_seconds is None:
+            duration_seconds = _probe_duration_seconds(input_path)
+        return _detect_scene_events_with_progress(
+            cmd,
+            duration_seconds=duration_seconds,
+        )
+
     result = _run_command(cmd, capture_output=True)
     output = (result.stderr or "") + "\n" + (result.stdout or "")
     matches = SCENE_PTS_PATTERN.findall(output)
@@ -210,6 +310,107 @@ def merge_segments(segments: list[Segment], merge_gap: float = 0.25) -> list[Seg
     return merged
 
 
+def _rank_event_candidates(
+    events: list[float],
+    *,
+    min_gap_seconds: float,
+    duration_seconds: float,
+    clip_before: float,
+    clip_after: float,
+) -> list[float]:
+    filtered: list[float] = []
+    for event in sorted(events):
+        if event < 0:
+            continue
+        if not filtered or event - filtered[-1] >= min_gap_seconds:
+            filtered.append(event)
+    if not filtered:
+        return []
+
+    density_window = max(min_gap_seconds, clip_before + clip_after, 15.0)
+    scored: list[tuple[float, float]] = []
+    for event in filtered:
+        local_density = sum(1 for other in filtered if abs(other - event) <= density_window)
+        late_game_weight = 1.0 + (event / duration_seconds if duration_seconds > 0 else 0.0)
+        scored.append((local_density * late_game_weight, event))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [event for _, event in scored]
+
+
+def _generate_fallback_centers(
+    *,
+    start: float,
+    end: float,
+    count: int,
+    min_gap_seconds: float,
+    existing: list[float],
+) -> list[float]:
+    if count <= 0 or end <= start:
+        return []
+
+    selected: list[float] = []
+    grid_count = max(12, count * 4)
+    step = (end - start) / (grid_count + 1)
+    for index in range(1, grid_count + 1):
+        center = start + step * index
+        if any(abs(center - value) < min_gap_seconds for value in existing + selected):
+            continue
+        selected.append(center)
+        if len(selected) >= count:
+            return selected
+
+    remaining = count - len(selected)
+    if remaining <= 0:
+        return selected
+
+    if remaining == 1:
+        selected.append((start + end) / 2)
+        return selected
+
+    spacing = (end - start) / (remaining + 1)
+    for index in range(remaining):
+        selected.append(start + spacing * (index + 1))
+    return selected
+
+
+def _build_segment_from_center(
+    center: float,
+    *,
+    clip_before: float,
+    clip_after: float,
+    clamp_start: float,
+    clamp_end: float,
+) -> Segment | None:
+    start = max(clamp_start, center - clip_before)
+    end = min(clamp_end, center + clip_after)
+    if end <= start:
+        return None
+    return Segment(start=start, end=end)
+
+
+def _derive_outro_segment(
+    *,
+    duration_seconds: float,
+    events: list[float],
+    clip_after: float,
+    outro_seconds: float,
+) -> Segment | None:
+    if duration_seconds <= 0 or outro_seconds <= 0:
+        return None
+
+    likely_finish = duration_seconds
+    if events:
+        last_event = max(events)
+        if duration_seconds - last_event <= 180.0:
+            likely_finish = min(duration_seconds, last_event + max(clip_after, 12.0))
+
+    outro_end = max(0.0, likely_finish)
+    outro_start = max(0.0, outro_end - outro_seconds)
+    if outro_end <= outro_start:
+        return None
+    return Segment(start=outro_start, end=outro_end)
+
+
 def build_segments(
     events: list[float],
     *,
@@ -218,30 +419,96 @@ def build_segments(
     clip_after: float,
     min_gap_seconds: float,
     max_clips: int,
+    target_duration_seconds: float = DEFAULT_TARGET_DURATION_SECONDS,
+    intro_seconds: float = DEFAULT_INTRO_SECONDS,
+    outro_seconds: float = DEFAULT_OUTRO_SECONDS,
 ) -> tuple[list[Segment], bool]:
     if duration_seconds <= 0 or max_clips <= 0:
         return [], False
 
-    filtered: list[float] = []
-    for event in sorted(events):
-        if not filtered or event - filtered[-1] >= min_gap_seconds:
-            filtered.append(event)
-    filtered = sample_evenly(filtered, max_clips)
+    intro_end = min(duration_seconds, max(0.0, intro_seconds))
+    intro_segment = Segment(start=0.0, end=intro_end) if intro_end > 0 else None
+    outro_segment = _derive_outro_segment(
+        duration_seconds=duration_seconds,
+        events=events,
+        clip_after=clip_after,
+        outro_seconds=max(0.0, outro_seconds),
+    )
 
+    anchored_segments = [segment for segment in (intro_segment, outro_segment) if segment is not None]
+    if (
+        intro_segment is not None
+        and outro_segment is not None
+        and intro_segment.end >= outro_segment.start
+    ):
+        return [Segment(0.0, duration_seconds)], False
+
+    interior_start = intro_segment.end if intro_segment is not None else 0.0
+    interior_end = outro_segment.start if outro_segment is not None else duration_seconds
+    clip_window_seconds = clip_before + clip_after
+    target_total_duration = min(duration_seconds, max(0.0, target_duration_seconds))
+    anchored_duration = sum(segment.duration for segment in anchored_segments)
+    target_middle_duration = max(0.0, target_total_duration - anchored_duration)
+
+    middle_clip_target = 0
+    if clip_window_seconds > 0 and interior_end > interior_start and target_middle_duration > 0:
+        middle_clip_target = min(max_clips, math.ceil(target_middle_duration / clip_window_seconds))
+
+    middle_segments: list[Segment] = []
     used_fallback = False
-    if not filtered:
-        fallback_points = [0.25, 0.5, 0.75]
-        filtered = [duration_seconds * point for point in fallback_points]
-        used_fallback = True
+    if middle_clip_target > 0:
+        effective_clip_before = clip_before
+        effective_clip_after = clip_after
+        if clip_window_seconds > 0 and target_middle_duration > 0:
+            target_per_clip = target_middle_duration / middle_clip_target
+            if target_per_clip > clip_window_seconds:
+                expansion_factor = target_per_clip / clip_window_seconds
+                effective_clip_before *= expansion_factor
+                effective_clip_after *= expansion_factor
 
-    segments: list[Segment] = []
-    for event in filtered:
-        start = max(0.0, event - clip_before)
-        end = min(duration_seconds, event + clip_after)
-        if end > start:
-            segments.append(Segment(start=start, end=end))
+        ranked_events = _rank_event_candidates(
+            events,
+            min_gap_seconds=min_gap_seconds,
+            duration_seconds=duration_seconds,
+            clip_before=effective_clip_before,
+            clip_after=effective_clip_after,
+        )
 
-    return merge_segments(segments), used_fallback
+        selected_centers: list[float] = []
+        for event in ranked_events:
+            if event <= interior_start or event >= interior_end:
+                continue
+            if any(abs(event - chosen) < min_gap_seconds for chosen in selected_centers):
+                continue
+            selected_centers.append(event)
+            if len(selected_centers) >= middle_clip_target:
+                break
+
+        if len(selected_centers) < middle_clip_target:
+            used_fallback = True
+            selected_centers.extend(
+                _generate_fallback_centers(
+                    start=interior_start,
+                    end=interior_end,
+                    count=middle_clip_target - len(selected_centers),
+                    min_gap_seconds=min_gap_seconds,
+                    existing=selected_centers,
+                )
+            )
+
+        for center in sorted(selected_centers):
+            segment = _build_segment_from_center(
+                center,
+                clip_before=effective_clip_before,
+                clip_after=effective_clip_after,
+                clamp_start=interior_start,
+                clamp_end=interior_end,
+            )
+            if segment is not None:
+                middle_segments.append(segment)
+
+    all_segments = anchored_segments + middle_segments
+    return merge_segments(all_segments), used_fallback
 
 
 def _format_seconds(seconds: float) -> str:
@@ -442,17 +709,6 @@ def _looks_like_loudnorm_nonfinite_error(error: subprocess.CalledProcessError) -
 
 
 def _extract_loudnorm_json(analysis_output: str) -> dict[str, float]:
-    start = analysis_output.rfind("{")
-    end = analysis_output.rfind("}")
-    if start < 0 or end <= start:
-        raise EditorError("Could not parse loudnorm analysis output.")
-
-    try:
-        payload = json.loads(analysis_output[start : end + 1])
-    except json.JSONDecodeError as error:
-        raise EditorError("Could not decode loudnorm analysis JSON.") from error
-
-    extracted: dict[str, float] = {}
     required = {
         "input_i": "measured_I",
         "input_tp": "measured_TP",
@@ -460,9 +716,40 @@ def _extract_loudnorm_json(analysis_output: str) -> dict[str, float]:
         "input_thresh": "measured_thresh",
         "target_offset": "offset",
     }
+    json_candidates: list[str] = []
+    depth = 0
+    object_start: int | None = None
+    for index, character in enumerate(analysis_output):
+        if character == "{":
+            if depth == 0:
+                object_start = index
+            depth += 1
+        elif character == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and object_start is not None:
+                json_candidates.append(analysis_output[object_start : index + 1])
+                object_start = None
+
+    if not json_candidates:
+        raise EditorError("Could not parse loudnorm analysis output.")
+
+    payload: dict[str, object] | None = None
+    for candidate in reversed(json_candidates):
+        try:
+            decoded = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(decoded, dict) and all(key in decoded for key in required):
+            payload = decoded
+            break
+
+    if payload is None:
+        raise EditorError("Could not decode loudnorm analysis JSON.")
+
+    extracted: dict[str, float] = {}
     for source_key, output_key in required.items():
-        if source_key not in payload:
-            raise EditorError(f"Missing '{source_key}' in loudnorm analysis output.")
         try:
             value = float(payload[source_key])
         except (TypeError, ValueError) as error:
@@ -514,7 +801,7 @@ def _run_with_loudnorm_fallback(
         return
 
     try:
-        _run_command(command_with_loudnorm, capture_output=True)
+        _run_command_with_stderr_tail(command_with_loudnorm)
     except subprocess.CalledProcessError as error:
         if not _looks_like_loudnorm_nonfinite_error(error):
             raise
@@ -523,6 +810,30 @@ def _run_with_loudnorm_fallback(
             file=sys.stderr,
         )
         _run_command(command_without_loudnorm)
+
+
+def _run_command_with_stderr_tail(cmd: list[str], *, tail_bytes: int = 256 * 1024) -> None:
+    with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as stderr_file:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+        )
+        if completed.returncode == 0:
+            return
+
+        stderr_file.flush()
+        file_size = stderr_file.tell()
+        start = max(0, file_size - tail_bytes)
+        stderr_file.seek(start, os.SEEK_SET)
+        stderr_tail = stderr_file.read()
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            cmd,
+            stderr=stderr_tail,
+        )
 
 
 def render_highlights(
@@ -771,9 +1082,17 @@ def analyze_recording(
     clip_after: float,
     min_gap_seconds: float,
     max_clips: int,
+    target_duration_seconds: float,
+    intro_seconds: float,
+    outro_seconds: float,
 ) -> dict[str, int | float | bool]:
     duration_seconds = _probe_duration_seconds(input_path)
-    events = detect_scene_events(input_path, scene_threshold)
+    events = detect_scene_events(
+        input_path,
+        scene_threshold,
+        duration_seconds=duration_seconds,
+        show_progress=True,
+    )
     segments, used_fallback = build_segments(
         events,
         duration_seconds=duration_seconds,
@@ -781,6 +1100,9 @@ def analyze_recording(
         clip_after=clip_after,
         min_gap_seconds=min_gap_seconds,
         max_clips=max_clips,
+        target_duration_seconds=target_duration_seconds,
+        intro_seconds=intro_seconds,
+        outro_seconds=outro_seconds,
     )
     settings = {
         "scene_threshold": scene_threshold,
@@ -788,6 +1110,9 @@ def analyze_recording(
         "clip_after": clip_after,
         "min_gap_seconds": min_gap_seconds,
         "max_clips": max_clips,
+        "target_duration_seconds": target_duration_seconds,
+        "intro_seconds": intro_seconds,
+        "outro_seconds": outro_seconds,
     }
     write_plan(
         input_path=input_path,
@@ -828,10 +1153,16 @@ def _validate_cli_options(args: argparse.Namespace) -> None:
             ("clip-before", args.clip_before),
             ("clip-after", args.clip_after),
             ("min-gap-seconds", args.min_gap_seconds),
+            ("target-duration-seconds", args.target_duration_seconds),
+            ("intro-seconds", args.intro_seconds),
+            ("outro-seconds", args.outro_seconds),
         ):
             _require_finite(option_name, option_value)
             if option_value < 0:
                 raise EditorError(f"--{option_name} must be >= 0.")
+
+        if args.target_duration_seconds <= 0:
+            raise EditorError("--target-duration-seconds must be > 0.")
 
         if args.max_clips < 1:
             raise EditorError("--max-clips must be >= 1.")
@@ -848,6 +1179,10 @@ def _validate_cli_options(args: argparse.Namespace) -> None:
             raise EditorError("--crf must be between 0 and 51.")
         if args.video_encoder not in VIDEO_ENCODERS:
             raise EditorError(f"--video-encoder must be one of: {', '.join(VIDEO_ENCODERS)}.")
+        if args.video_encoder != "libx264" and args.preset != "medium":
+            raise EditorError(
+                "--preset applies only to libx264. Use the default preset with hardware encoders."
+            )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -871,7 +1206,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--clip-before", type=float, default=8.0)
     analyze.add_argument("--clip-after", type=float, default=12.0)
     analyze.add_argument("--min-gap-seconds", type=float, default=18.0)
-    analyze.add_argument("--max-clips", type=int, default=20)
+    analyze.add_argument(
+        "--max-clips",
+        type=int,
+        default=20,
+        help="Maximum number of middle highlight clips between intro and outro anchors.",
+    )
+    analyze.add_argument(
+        "--target-duration-seconds",
+        type=float,
+        default=DEFAULT_TARGET_DURATION_SECONDS,
+        help="Approximate target duration for final highlights output.",
+    )
+    analyze.add_argument(
+        "--intro-seconds",
+        type=float,
+        default=DEFAULT_INTRO_SECONDS,
+        help="Seconds to keep from the beginning for game load-in.",
+    )
+    analyze.add_argument(
+        "--outro-seconds",
+        type=float,
+        default=DEFAULT_OUTRO_SECONDS,
+        help="Seconds to keep at the end for match finish/nexus destruction.",
+    )
 
     render = subparsers.add_parser(
         "render", help="Render highlights MP4 from an existing edit plan JSON."
@@ -914,6 +1272,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="medium",
         choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"],
+        help="Encoder preset for libx264 only. Hardware encoders use their own defaults.",
     )
 
     auto = subparsers.add_parser(
@@ -927,7 +1286,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     auto.add_argument("--clip-before", type=float, default=8.0)
     auto.add_argument("--clip-after", type=float, default=12.0)
     auto.add_argument("--min-gap-seconds", type=float, default=18.0)
-    auto.add_argument("--max-clips", type=int, default=20)
+    auto.add_argument(
+        "--max-clips",
+        type=int,
+        default=20,
+        help="Maximum number of middle highlight clips between intro and outro anchors.",
+    )
+    auto.add_argument(
+        "--target-duration-seconds",
+        type=float,
+        default=DEFAULT_TARGET_DURATION_SECONDS,
+        help="Approximate target duration for final highlights output.",
+    )
+    auto.add_argument(
+        "--intro-seconds",
+        type=float,
+        default=DEFAULT_INTRO_SECONDS,
+        help="Seconds to keep from the beginning for game load-in.",
+    )
+    auto.add_argument(
+        "--outro-seconds",
+        type=float,
+        default=DEFAULT_OUTRO_SECONDS,
+        help="Seconds to keep at the end for match finish/nexus destruction.",
+    )
     auto.add_argument("--crf", type=int, default=20)
     auto.add_argument(
         "--video-encoder",
@@ -963,6 +1345,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="medium",
         choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"],
+        help="Encoder preset for libx264 only. Hardware encoders use their own defaults.",
     )
 
     full = subparsers.add_parser(
@@ -994,6 +1377,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="medium",
         choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"],
+        help="Encoder preset for libx264 only. Hardware encoders use their own defaults.",
     )
     return parser
 
@@ -1017,6 +1401,9 @@ def main(argv: list[str] | None = None) -> int:
                 clip_after=args.clip_after,
                 min_gap_seconds=args.min_gap_seconds,
                 max_clips=args.max_clips,
+                target_duration_seconds=args.target_duration_seconds,
+                intro_seconds=args.intro_seconds,
+                outro_seconds=args.outro_seconds,
             )
             print(
                 f"Wrote {args.plan} with {stats['segment_count']} segments "
@@ -1050,6 +1437,9 @@ def main(argv: list[str] | None = None) -> int:
                 clip_after=args.clip_after,
                 min_gap_seconds=args.min_gap_seconds,
                 max_clips=args.max_clips,
+                target_duration_seconds=args.target_duration_seconds,
+                intro_seconds=args.intro_seconds,
+                outro_seconds=args.outro_seconds,
             )
             render_highlights(
                 input_path=args.input,
@@ -1092,6 +1482,9 @@ def main(argv: list[str] | None = None) -> int:
         if error.stderr:
             print(error.stderr, file=sys.stderr)
         return error.returncode or 1
+    except KeyboardInterrupt:
+        print("Canceled by user.", file=sys.stderr)
+        return 130
     return 1
 
 
