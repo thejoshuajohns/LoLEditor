@@ -53,8 +53,46 @@ class SegmentLogicTests(unittest.TestCase):
             max_clips=20,
         )
         self.assertTrue(used_fallback)
-        self.assertEqual(len(segments), 3)
-        self.assertGreater(segments[0].duration, 0.0)
+        self.assertGreaterEqual(len(segments), 2)
+        self.assertAlmostEqual(segments[0].start, 0.0)
+        self.assertAlmostEqual(segments[-1].end, 1200.0)
+
+    def test_build_segments_targets_approximately_ten_minutes(self) -> None:
+        events = [float(value) for value in range(60, 1140, 24)]
+        segments, used_fallback = build_segments(
+            events,
+            duration_seconds=1200.0,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=30,
+            target_duration_seconds=600.0,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+        )
+        self.assertFalse(used_fallback)
+        self.assertAlmostEqual(segments[0].start, 0.0)
+        self.assertAlmostEqual(segments[-1].end, 1128.0)
+        total_duration = sum(segment.duration for segment in segments)
+        self.assertGreaterEqual(total_duration, 560.0)
+        self.assertLessEqual(total_duration, 640.0)
+
+    def test_build_segments_expands_clip_windows_to_hit_target_with_limited_clips(self) -> None:
+        events = [float(value) for value in range(60, 1140, 24)]
+        segments, used_fallback = build_segments(
+            events,
+            duration_seconds=1200.0,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=20,
+            target_duration_seconds=600.0,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+        )
+        self.assertFalse(used_fallback)
+        total_duration = sum(segment.duration for segment in segments)
+        self.assertGreaterEqual(total_duration, 560.0)
 
     def test_build_segments_with_zero_max_clips_returns_empty(self) -> None:
         segments, used_fallback = build_segments(
@@ -159,6 +197,9 @@ class SegmentLogicTests(unittest.TestCase):
             clip_after=12.0,
             min_gap_seconds=18.0,
             max_clips=20,
+            target_duration_seconds=600.0,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
         )
         with self.assertRaisesRegex(EditorError, "finite number"):
             _validate_cli_options(args)
@@ -171,16 +212,20 @@ class SegmentLogicTests(unittest.TestCase):
             clip_after=12.0,
             min_gap_seconds=18.0,
             max_clips=0,
+            target_duration_seconds=600.0,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
             crf=20,
             crossfade_seconds=0.0,
             audio_fade_seconds=0.03,
             video_encoder="libx264",
+            preset="medium",
         )
         with self.assertRaisesRegex(EditorError, "scene-threshold must be between 0.0 and 1.0"):
             _validate_cli_options(args)
 
     def test_validate_cli_options_rejects_crf_out_of_range(self) -> None:
-        args = argparse.Namespace(command="full", crf=52, video_encoder="libx264")
+        args = argparse.Namespace(command="full", crf=52, video_encoder="libx264", preset="medium")
         with self.assertRaisesRegex(EditorError, "crf must be between 0 and 51"):
             _validate_cli_options(args)
 
@@ -191,6 +236,7 @@ class SegmentLogicTests(unittest.TestCase):
             crossfade_seconds=-0.1,
             audio_fade_seconds=0.03,
             video_encoder="libx264",
+            preset="medium",
         )
         with self.assertRaisesRegex(EditorError, "crossfade-seconds"):
             _validate_cli_options(args)
@@ -200,8 +246,19 @@ class SegmentLogicTests(unittest.TestCase):
             command="full",
             crf=20,
             video_encoder="not-real",
+            preset="medium",
         )
         with self.assertRaisesRegex(EditorError, "video-encoder must be one of"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_non_default_preset_for_hardware_encoder(self) -> None:
+        args = argparse.Namespace(
+            command="full",
+            crf=20,
+            video_encoder="h264_videotoolbox",
+            preset="fast",
+        )
+        with self.assertRaisesRegex(EditorError, "preset applies only to libx264"):
             _validate_cli_options(args)
 
     def test_render_highlights_creates_output_directory(self) -> None:
@@ -274,7 +331,14 @@ class SegmentLogicTests(unittest.TestCase):
             with (
                 patch("league_video_editor.cli.read_plan", return_value=[Segment(0.0, 1.0)]),
                 patch("league_video_editor.cli._has_audio_stream", return_value=True),
-                patch("league_video_editor.cli._run_command", side_effect=[first_error, success]) as run_command,
+                patch(
+                    "league_video_editor.cli._run_command_with_stderr_tail",
+                    side_effect=[first_error],
+                ) as run_with_stderr_tail,
+                patch(
+                    "league_video_editor.cli._run_command",
+                    return_value=success,
+                ) as run_command,
             ):
                 render_highlights(
                     input_path=input_path,
@@ -289,11 +353,10 @@ class SegmentLogicTests(unittest.TestCase):
                     two_pass_loudnorm=False,
                 )
 
-            self.assertEqual(run_command.call_count, 2)
-            first_command = run_command.call_args_list[0].args[0]
-            first_kwargs = run_command.call_args_list[0].kwargs
-            second_command = run_command.call_args_list[1].args[0]
-            self.assertTrue(first_kwargs.get("capture_output", False))
+            self.assertEqual(run_with_stderr_tail.call_count, 1)
+            self.assertEqual(run_command.call_count, 1)
+            first_command = run_with_stderr_tail.call_args_list[0].args[0]
+            second_command = run_command.call_args_list[0].args[0]
             self.assertIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(first_command))
             self.assertNotIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(second_command))
             self.assertIn("-c:a", second_command)
@@ -313,7 +376,14 @@ class SegmentLogicTests(unittest.TestCase):
 
             with (
                 patch("league_video_editor.cli._has_audio_stream", return_value=True),
-                patch("league_video_editor.cli._run_command", side_effect=[first_error, success]) as run_command,
+                patch(
+                    "league_video_editor.cli._run_command_with_stderr_tail",
+                    side_effect=[first_error],
+                ) as run_with_stderr_tail,
+                patch(
+                    "league_video_editor.cli._run_command",
+                    return_value=success,
+                ) as run_command,
             ):
                 transcode_full_match(
                     input_path=input_path,
@@ -325,11 +395,10 @@ class SegmentLogicTests(unittest.TestCase):
                     two_pass_loudnorm=False,
                 )
 
-            self.assertEqual(run_command.call_count, 2)
-            first_command = run_command.call_args_list[0].args[0]
-            first_kwargs = run_command.call_args_list[0].kwargs
-            second_command = run_command.call_args_list[1].args[0]
-            self.assertTrue(first_kwargs.get("capture_output", False))
+            self.assertEqual(run_with_stderr_tail.call_count, 1)
+            self.assertEqual(run_command.call_count, 1)
+            first_command = run_with_stderr_tail.call_args_list[0].args[0]
+            second_command = run_command.call_args_list[0].args[0]
             self.assertIn("-af", first_command)
             self.assertIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(first_command))
             self.assertNotIn("loudnorm=I=-14:LRA=11:TP=-1.5", " ".join(second_command))
@@ -361,8 +430,12 @@ class SegmentLogicTests(unittest.TestCase):
                 patch("league_video_editor.cli._has_audio_stream", return_value=True),
                 patch(
                     "league_video_editor.cli._run_command",
-                    side_effect=[analysis_result, encode_result],
+                    side_effect=[analysis_result],
                 ) as run_command,
+                patch(
+                    "league_video_editor.cli._run_command_with_stderr_tail",
+                    return_value=encode_result,
+                ) as run_with_stderr_tail,
             ):
                 render_highlights(
                     input_path=input_path,
@@ -377,9 +450,10 @@ class SegmentLogicTests(unittest.TestCase):
                     two_pass_loudnorm=True,
                 )
 
-            self.assertEqual(run_command.call_count, 2)
+            self.assertEqual(run_command.call_count, 1)
+            self.assertEqual(run_with_stderr_tail.call_count, 1)
             analysis_command = run_command.call_args_list[0].args[0]
-            encode_command = run_command.call_args_list[1].args[0]
+            encode_command = run_with_stderr_tail.call_args_list[0].args[0]
             self.assertIn("print_format=json", " ".join(analysis_command))
             self.assertIn("measured_I=", " ".join(encode_command))
 
@@ -428,6 +502,22 @@ class SegmentLogicTests(unittest.TestCase):
         self.assertAlmostEqual(data["measured_LRA"], 6.5)
         self.assertAlmostEqual(data["measured_thresh"], -31.0)
         self.assertAlmostEqual(data["offset"], 0.1)
+
+    def test_extract_loudnorm_json_uses_last_matching_object(self) -> None:
+        data = _extract_loudnorm_json(
+            """
+            {"debug":"value"}
+            {
+              "input_i": "-18.0",
+              "input_tp": "-1.8",
+              "input_lra": "4.5",
+              "input_thresh": "-28.0",
+              "target_offset": "0.2"
+            }
+            """
+        )
+        self.assertAlmostEqual(data["measured_I"], -18.0)
+        self.assertAlmostEqual(data["offset"], 0.2)
 
     def test_loudnorm_error_matcher_accepts_variant_message(self) -> None:
         error = subprocess.CalledProcessError(
