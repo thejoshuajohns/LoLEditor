@@ -2004,7 +2004,8 @@ def _build_watchability_report(
     )
 
     engagement_component = avg_score
-    pacing_component = _closeness_score(event_rate_per_minute, target=8.0, tolerance=8.0)
+    raw_pacing = _closeness_score(event_rate_per_minute, target=8.0, tolerance=8.0)
+    pacing_component = max(0.12, raw_pacing)
     variety_component = min(1.0, score_std / 0.18)
     idle_component = 1.0 - low_activity_ratio
     gray_component = 1.0 - min(1.0, gray_ratio * 1.2)
@@ -2034,6 +2035,9 @@ def _build_watchability_report(
         recommendations.append("Reduce cut frequency to improve flow continuity.")
     if event_rate_per_minute < 3:
         recommendations.append("Include more high-impact moments (fights, objectives, deaths).")
+        recommendations.append(
+            "Re-analyze with --max-clips 20 and --min-gap-seconds 18 to include more highlight moments."
+        )
     if high_activity_ratio < 0.18:
         recommendations.append("Prioritize more high-intensity sequences to improve excitement.")
     if gray_ratio > 0.30:
@@ -2241,11 +2245,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--scene-threshold", type=float, default=0.35)
     analyze.add_argument("--clip-before", type=float, default=12.0)
     analyze.add_argument("--clip-after", type=float, default=18.0)
-    analyze.add_argument("--min-gap-seconds", type=float, default=24.0)
+    analyze.add_argument("--min-gap-seconds", type=float, default=20.0)
     analyze.add_argument(
         "--max-clips",
         type=int,
-        default=14,
+        default=18,
         help="Maximum number of middle highlight clips between intro and outro anchors.",
     )
     analyze.add_argument(
@@ -2352,11 +2356,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     auto.add_argument("--scene-threshold", type=float, default=0.35)
     auto.add_argument("--clip-before", type=float, default=12.0)
     auto.add_argument("--clip-after", type=float, default=18.0)
-    auto.add_argument("--min-gap-seconds", type=float, default=24.0)
+    auto.add_argument("--min-gap-seconds", type=float, default=20.0)
     auto.add_argument(
         "--max-clips",
         type=int,
-        default=14,
+        default=18,
         help="Maximum number of middle highlight clips between intro and outro anchors.",
     )
     auto.add_argument(
