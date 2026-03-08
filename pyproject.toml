@@ -11,7 +11,9 @@ requires-python = ">=3.11"
 authors = [
   { name = "LeagueOfLegendsEditor" }
 ]
-dependencies = []
+dependencies = [
+  "Pillow>=10.0.0",
+]
 
 [project.scripts]
 lol-video-editor = "league_video_editor.cli:main"

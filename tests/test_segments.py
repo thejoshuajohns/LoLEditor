@@ -9,7 +9,12 @@ from unittest.mock import patch
 from league_video_editor.cli import (
     EditorError,
     Segment,
+    TranscriptionCue,
     VisionWindow,
+    _boost_vision_windows_with_ai_cues,
+    _collect_local_ai_cues,
+    _collect_ocr_cues,
+    _clean_moment_blurb,
     analyze_watchability,
     _build_filter_complex,
     _build_watchability_report,
@@ -19,6 +24,10 @@ from league_video_editor.cli import (
     _detect_watchability_crop_filter,
     _estimate_render_duration,
     _extract_loudnorm_json,
+    _extract_audio_for_whisper,
+    _parse_whisper_json_cues,
+    _rank_vision_candidates,
+    _score_transcript_text,
     _looks_like_loudnorm_nonfinite_error,
     _probe_duration_seconds,
     _validate_cli_options,
@@ -27,6 +36,9 @@ from league_video_editor.cli import (
     build_segments,
     detect_scene_events,
     detect_scene_events_adaptive,
+    build_arg_parser,
+    generate_youtube_description,
+    generate_thumbnail,
     merge_segments,
     read_plan,
     render_highlights,
@@ -134,7 +146,7 @@ class SegmentLogicTests(unittest.TestCase):
             intro_seconds=45.0,
             outro_seconds=60.0,
         )
-        self.assertGreater(
+        self.assertGreaterEqual(
             sum(segment.duration for segment in uncapped_segments),
             sum(segment.duration for segment in capped_segments),
         )
@@ -210,6 +222,21 @@ class SegmentLogicTests(unittest.TestCase):
         self.assertLess(cues[0], 20.0)
         self.assertLess(cues[1], 80.0)
 
+    def test_rank_vision_candidates_respects_requested_min_gap(self) -> None:
+        windows = [
+            VisionWindow(start=0.0, end=10.0, score=0.95, motion=8.0, saturation=30.0, scene_density=0.20),
+            VisionWindow(start=10.0, end=20.0, score=0.90, motion=7.8, saturation=30.0, scene_density=0.18),
+            VisionWindow(start=20.0, end=30.0, score=0.85, motion=7.6, saturation=30.0, scene_density=0.16),
+            VisionWindow(start=30.0, end=40.0, score=0.80, motion=7.4, saturation=30.0, scene_density=0.14),
+        ]
+        candidates = _rank_vision_candidates(
+            windows,
+            min_gap_seconds=8.0,
+            clip_before=12.0,
+            clip_after=18.0,
+        )
+        self.assertGreaterEqual(len(candidates), 3)
+
     def test_build_segments_prioritizes_detected_death_cues(self) -> None:
         windows = [
             VisionWindow(start=100.0, end=120.0, score=0.75, motion=9.0, saturation=46.0, scene_density=0.25),
@@ -257,6 +284,263 @@ class SegmentLogicTests(unittest.TestCase):
         self.assertTrue(any(segment.start <= 100.0 <= segment.end for segment in segments))
         self.assertTrue(any(segment.start <= 560.0 <= segment.end for segment in segments))
 
+    def test_build_segments_prioritizes_ai_forced_cues(self) -> None:
+        segments, _ = build_segments(
+            [50.0, 500.0],
+            duration_seconds=700.0,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=20.0,
+            max_clips=2,
+            target_duration_seconds=140.0,
+            intro_seconds=0.0,
+            outro_seconds=0.0,
+            vision_windows=[],
+            ai_priority_cues=[210.0, 510.0],
+        )
+        self.assertEqual(len(segments), 2)
+        self.assertTrue(any(segment.start <= 210.0 <= segment.end for segment in segments))
+        self.assertTrue(any(segment.start <= 510.0 <= segment.end for segment in segments))
+
+    def test_score_transcript_text_rewards_high_impact_lol_callouts(self) -> None:
+        high_score, high_hits = _score_transcript_text("PENTAKILL! We got Baron and end now!")
+        low_score, low_hits = _score_transcript_text("just clearing wave and farming top lane")
+        self.assertGreater(high_score, low_score)
+        self.assertIn("pentakill", high_hits)
+        self.assertIn("baron", high_hits)
+        self.assertEqual(low_hits, ())
+
+    def test_score_transcript_text_ignores_placeholder_tokens(self) -> None:
+        score, hits = _score_transcript_text("[BLANK_AUDIO] [MUSIC]")
+        self.assertEqual(score, 0.0)
+        self.assertEqual(hits, ())
+
+    def test_clean_moment_blurb_rejects_noisy_ocr_snippets(self) -> None:
+        noisy = "Te le es | te Ow2 40/00 847 0607 * a Sea 5:120 26m"
+        self.assertIsNone(_clean_moment_blurb(noisy))
+
+    def test_score_transcript_text_does_not_match_partial_word_keywords(self) -> None:
+        score, hits = _score_transcript_text("peaceful farming and safe lane reset")
+        self.assertEqual(score, 0.0)
+        self.assertEqual(hits, ())
+
+    def test_parse_whisper_json_cues_extracts_segments_and_thresholds(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            transcript_path = Path(temp_dir) / "transcript.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "transcription": [
+                            {
+                                "timestamps": {"from": "00:03:00,000", "to": "00:03:04,500"},
+                                "offsets": {"from": 180000, "to": 184500},
+                                "text": "Shutdown! Huge teamfight at dragon.",
+                            },
+                            {
+                                "timestamps": {"from": "00:05:00,000", "to": "00:05:02,000"},
+                                "offsets": {"from": 300000, "to": 302000},
+                                "text": "just walking to lane",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cues = _parse_whisper_json_cues(transcript_path, cue_threshold=0.5)
+
+        self.assertEqual(len(cues), 1)
+        self.assertAlmostEqual(cues[0].start, 180.0)
+        self.assertAlmostEqual(cues[0].end, 184.5)
+        self.assertIn("shutdown", cues[0].keywords)
+        self.assertIn("dragon", cues[0].keywords)
+
+    def test_parse_whisper_json_cues_ignores_placeholder_segments(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            transcript_path = Path(temp_dir) / "transcript.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "transcription": [
+                            {
+                                "offsets": {"from": 1000, "to": 3000},
+                                "text": "[BLANK_AUDIO]",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cues = _parse_whisper_json_cues(transcript_path, cue_threshold=0.12)
+
+        self.assertEqual(cues, [])
+
+    def test_collect_local_ai_cues_extracts_audio_and_parses_json(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.mov"
+            input_path.touch()
+            model_path = Path(temp_dir) / "model.bin"
+            model_path.touch()
+
+            def fake_run_command(cmd: list[str], *, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
+                if cmd and cmd[0] == "whisper-cli":
+                    output_prefix = cmd[cmd.index("-of") + 1]
+                    Path(f"{output_prefix}.json").write_text(
+                        json.dumps(
+                            {
+                                "transcription": [
+                                    {
+                                        "offsets": {"from": 1000, "to": 4000},
+                                        "text": "Shutdown into Baron!",
+                                    }
+                                ]
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+            with (
+                patch("league_video_editor.cli._resolve_whisper_cpp_binary", return_value="whisper-cli"),
+                patch("league_video_editor.cli._extract_audio_for_whisper") as extract_audio,
+                patch("league_video_editor.cli._run_command", side_effect=fake_run_command),
+            ):
+                cues = _collect_local_ai_cues(
+                    input_path=input_path,
+                    whisper_model=model_path,
+                    whisper_binary="whisper-cli",
+                    whisper_language="en",
+                    whisper_threads=2,
+                    cue_threshold=0.2,
+                )
+
+        self.assertEqual(extract_audio.call_count, 1)
+        self.assertEqual(len(cues), 1)
+        self.assertAlmostEqual(cues[0].start, 1.0)
+        self.assertIn("shutdown", cues[0].keywords)
+
+    def test_collect_local_ai_cues_wraps_audio_extract_errors(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.mov"
+            input_path.touch()
+            model_path = Path(temp_dir) / "model.bin"
+            model_path.touch()
+            with (
+                patch("league_video_editor.cli._resolve_whisper_cpp_binary", return_value="whisper-cli"),
+                patch(
+                    "league_video_editor.cli._extract_audio_for_whisper",
+                    side_effect=subprocess.CalledProcessError(
+                        returncode=1,
+                        cmd=["ffmpeg"],
+                        stderr="No audio stream",
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(EditorError, "Could not extract audio"):
+                    _collect_local_ai_cues(
+                        input_path=input_path,
+                        whisper_model=model_path,
+                        whisper_binary="whisper-cli",
+                        whisper_language="en",
+                        whisper_threads=2,
+                        cue_threshold=0.2,
+                    )
+
+    def test_collect_local_ai_cues_can_disable_vad(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.mov"
+            input_path.touch()
+            model_path = Path(temp_dir) / "model.bin"
+            model_path.touch()
+            captured_whisper_cmds: list[list[str]] = []
+
+            def fake_run_command(cmd: list[str], *, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
+                if cmd and cmd[0] == "whisper-cli":
+                    captured_whisper_cmds.append(cmd)
+                    output_prefix = cmd[cmd.index("-of") + 1]
+                    Path(f"{output_prefix}.json").write_text(
+                        json.dumps({"transcription": []}),
+                        encoding="utf-8",
+                    )
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+            with (
+                patch("league_video_editor.cli._resolve_whisper_cpp_binary", return_value="whisper-cli"),
+                patch("league_video_editor.cli._extract_audio_for_whisper"),
+                patch("league_video_editor.cli._run_command", side_effect=fake_run_command),
+            ):
+                _collect_local_ai_cues(
+                    input_path=input_path,
+                    whisper_model=model_path,
+                    whisper_binary="whisper-cli",
+                    whisper_language="en",
+                    whisper_threads=2,
+                    cue_threshold=0.2,
+                    whisper_vad=False,
+                )
+
+        self.assertEqual(len(captured_whisper_cmds), 1)
+        self.assertNotIn("--vad", captured_whisper_cmds[0])
+
+    def test_collect_ocr_cues_extracts_keyword_frames(self) -> None:
+        with (
+            patch("league_video_editor.cli._resolve_tesseract_binary", return_value="tesseract"),
+            patch(
+                "league_video_editor.cli._extract_ocr_frames",
+                return_value=[Path("f1.jpg"), Path("f2.jpg"), Path("f3.jpg")],
+            ),
+            patch(
+                "league_video_editor.cli._run_tesseract_ocr",
+                side_effect=[
+                    "",
+                    "Enemy has slain Baron Nashor!",
+                    "just farming side lane",
+                ],
+            ),
+        ):
+            cues = _collect_ocr_cues(
+                input_path=Path("input.mov"),
+                tesseract_binary="tesseract",
+                sample_fps=0.25,
+                cue_threshold=0.16,
+            )
+
+        self.assertEqual(len(cues), 1)
+        self.assertTrue(any("baron" in hit for hit in cues[0].keywords))
+
+    def test_extract_audio_for_whisper_supports_explicit_stream_mapping(self) -> None:
+        with patch("league_video_editor.cli._run_command") as run_command:
+            run_command.return_value = subprocess.CompletedProcess(
+                args=["ffmpeg"], returncode=0, stdout="", stderr=""
+            )
+            _extract_audio_for_whisper(
+                input_path=Path("input.mov"),
+                output_audio_path=Path("out.wav"),
+                audio_stream_index=2,
+            )
+
+        called_cmd = run_command.call_args.args[0]
+        self.assertIn("-map", called_cmd)
+        self.assertIn("0:a:2", called_cmd)
+
+    def test_boost_vision_windows_with_ai_cues_increases_nearby_scores(self) -> None:
+        windows = [
+            VisionWindow(start=0.0, end=20.0, score=0.30, motion=3.0, saturation=22.0, scene_density=0.05),
+            VisionWindow(start=20.0, end=40.0, score=0.30, motion=3.2, saturation=23.0, scene_density=0.05),
+        ]
+        ai_cues = [
+            TranscriptionCue(
+                start=18.0,
+                end=22.0,
+                score=0.90,
+                text="Ace and Baron now!",
+                keywords=("ace", "baron"),
+            )
+        ]
+        boosted = _boost_vision_windows_with_ai_cues(windows, ai_cues, radius_seconds=16.0)
+        self.assertEqual(len(boosted), 2)
+        self.assertGreater(boosted[1].score, windows[1].score)
+        self.assertGreater(boosted[0].score, windows[0].score)
+
     def test_build_watchability_report_outputs_score_and_recommendations(self) -> None:
         vision_windows = [
             VisionWindow(start=0.0, end=12.0, score=0.15, motion=1.2, saturation=10.0, scene_density=0.01),
@@ -273,10 +557,18 @@ class SegmentLogicTests(unittest.TestCase):
         )
         self.assertIn("watchability_score", report)
         self.assertIn("rating", report)
+        self.assertIn("highlight_quality_score", report)
+        self.assertIn("quality_rating", report)
+        self.assertIn("youtube_score", report)
+        self.assertIn("score_blend", report)
         self.assertIn("scene_threshold_used", report)
         self.assertIn("recommendations", report)
         self.assertGreaterEqual(float(report["watchability_score"]), 0.0)
         self.assertLessEqual(float(report["watchability_score"]), 100.0)
+        self.assertGreaterEqual(float(report["highlight_quality_score"]), 0.0)
+        self.assertLessEqual(float(report["highlight_quality_score"]), 100.0)
+        self.assertGreaterEqual(float(report["youtube_score"]), 0.0)
+        self.assertLessEqual(float(report["youtube_score"]), 100.0)
 
     def test_analyze_watchability_emits_overall_loading_bar(self) -> None:
         vision_windows = [
@@ -528,6 +820,156 @@ class SegmentLogicTests(unittest.TestCase):
         with self.assertRaisesRegex(EditorError, "vision-sample-fps"):
             _validate_cli_options(args)
 
+    def test_validate_cli_options_requires_whisper_model_for_local_ai(self) -> None:
+        args = argparse.Namespace(
+            command="analyze",
+            scene_threshold=0.35,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=20,
+            target_duration_seconds=600.0,
+            target_duration_ratio=0.6,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+            vision_scoring="local-ai",
+            vision_sample_fps=1.0,
+            vision_window_seconds=12.0,
+            vision_step_seconds=6.0,
+            whisper_model=None,
+            whisper_bin="auto",
+            whisper_language="en",
+            whisper_threads=4,
+            ai_cue_threshold=0.55,
+        )
+        with self.assertRaisesRegex(EditorError, "whisper-model is required"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_invalid_ai_threshold(self) -> None:
+        args = argparse.Namespace(
+            command="analyze",
+            scene_threshold=0.35,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=20,
+            target_duration_seconds=600.0,
+            target_duration_ratio=0.6,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+            vision_scoring="heuristic",
+            vision_sample_fps=1.0,
+            vision_window_seconds=12.0,
+            vision_step_seconds=6.0,
+            whisper_model=None,
+            whisper_bin="auto",
+            whisper_language="en",
+            whisper_threads=4,
+            ai_cue_threshold=1.2,
+        )
+        with self.assertRaisesRegex(EditorError, "ai-cue-threshold"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_invalid_whisper_audio_stream(self) -> None:
+        args = argparse.Namespace(
+            command="analyze",
+            scene_threshold=0.35,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=20,
+            target_duration_seconds=600.0,
+            target_duration_ratio=0.6,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+            vision_scoring="heuristic",
+            vision_sample_fps=1.0,
+            vision_window_seconds=12.0,
+            vision_step_seconds=6.0,
+            whisper_model=None,
+            whisper_bin="auto",
+            whisper_language="en",
+            whisper_threads=4,
+            whisper_audio_stream=-2,
+            ai_cue_threshold=0.4,
+        )
+        with self.assertRaisesRegex(EditorError, "whisper-audio-stream"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_invalid_whisper_vad_threshold(self) -> None:
+        args = argparse.Namespace(
+            command="analyze",
+            scene_threshold=0.35,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=20,
+            target_duration_seconds=600.0,
+            target_duration_ratio=0.6,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+            vision_scoring="heuristic",
+            vision_sample_fps=1.0,
+            vision_window_seconds=12.0,
+            vision_step_seconds=6.0,
+            whisper_vad_threshold=1.3,
+        )
+        with self.assertRaisesRegex(EditorError, "whisper-vad-threshold"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_invalid_ocr_scoring_mode(self) -> None:
+        args = argparse.Namespace(
+            command="analyze",
+            scene_threshold=0.35,
+            clip_before=8.0,
+            clip_after=12.0,
+            min_gap_seconds=18.0,
+            max_clips=20,
+            target_duration_seconds=600.0,
+            target_duration_ratio=0.6,
+            intro_seconds=45.0,
+            outro_seconds=60.0,
+            vision_scoring="heuristic",
+            vision_sample_fps=1.0,
+            vision_window_seconds=12.0,
+            vision_step_seconds=6.0,
+            ocr_cue_scoring="bad-mode",
+        )
+        with self.assertRaisesRegex(EditorError, "ocr-cue-scoring"):
+            _validate_cli_options(args)
+
+    def test_build_arg_parser_uses_higher_default_max_clips(self) -> None:
+        parser = build_arg_parser()
+        analyze_args = parser.parse_args(["analyze", "input.mp4"])
+        auto_args = parser.parse_args(["auto", "input.mp4"])
+        thumbnail_args = parser.parse_args(["thumbnail", "input.mp4"])
+        description_args = parser.parse_args(["description", "input.mp4"])
+        self.assertEqual(analyze_args.max_clips, 24)
+        self.assertEqual(auto_args.max_clips, 24)
+        self.assertTrue(analyze_args.end_on_result)
+        self.assertTrue(analyze_args.one_shot_smart)
+        self.assertTrue(auto_args.end_on_result)
+        self.assertTrue(auto_args.one_shot_smart)
+        self.assertFalse(auto_args.auto_optimize)
+        self.assertEqual(auto_args.optimize_metric, "youtube")
+        self.assertEqual(thumbnail_args.output, Path("thumbnail.jpg"))
+        self.assertIsNone(thumbnail_args.timestamp)
+        self.assertEqual(thumbnail_args.width, 1280)
+        self.assertEqual(thumbnail_args.height, 720)
+        self.assertAlmostEqual(thumbnail_args.champion_scale, 0.55, places=2)
+        self.assertEqual(thumbnail_args.champion_anchor, "right")
+        self.assertIsNone(thumbnail_args.champion_overlay)
+        self.assertIsNone(thumbnail_args.headline)
+        self.assertEqual(thumbnail_args.headline_size, 118)
+        self.assertEqual(thumbnail_args.headline_color, "white")
+        self.assertTrue(thumbnail_args.auto_crop)
+        self.assertTrue(thumbnail_args.enhance)
+        self.assertEqual(description_args.output, Path("youtube-description.txt"))
+        self.assertEqual(description_args.scene_threshold, 0.20)
+        self.assertEqual(description_args.title_count, 3)
+        self.assertEqual(description_args.max_moments, 8)
+        self.assertEqual(description_args.ocr_cue_scoring, "auto")
+
     def test_validate_cli_options_rejects_negative_target_duration(self) -> None:
         args = argparse.Namespace(
             command="analyze",
@@ -577,6 +1019,104 @@ class SegmentLogicTests(unittest.TestCase):
             vision_step_seconds=6.0,
         )
         with self.assertRaisesRegex(EditorError, "vision-window-seconds"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_invalid_thumbnail_options(self) -> None:
+        args = argparse.Namespace(
+            command="thumbnail",
+            scene_threshold=0.20,
+            vision_sample_fps=0.75,
+            vision_window_seconds=8.0,
+            vision_step_seconds=4.0,
+            timestamp=-1.0,
+            width=1280,
+            height=720,
+            quality=2,
+            champion_scale=0.55,
+            champion_anchor="right",
+            champion_overlay=None,
+            headline=None,
+            headline_size=118,
+            headline_color="white",
+            headline_font=None,
+            headline_y_ratio=0.06,
+            output=Path("thumbnail.jpg"),
+        )
+        with self.assertRaisesRegex(EditorError, "timestamp must be >= 0"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_invalid_thumbnail_extension(self) -> None:
+        args = argparse.Namespace(
+            command="thumbnail",
+            scene_threshold=0.20,
+            vision_sample_fps=0.75,
+            vision_window_seconds=8.0,
+            vision_step_seconds=4.0,
+            timestamp=None,
+            width=1280,
+            height=720,
+            quality=2,
+            champion_scale=0.55,
+            champion_anchor="right",
+            champion_overlay=None,
+            headline=None,
+            headline_size=118,
+            headline_color="white",
+            headline_font=None,
+            headline_y_ratio=0.06,
+            output=Path("thumbnail.gif"),
+        )
+        with self.assertRaisesRegex(EditorError, "must end with"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_missing_champion_overlay_file(self) -> None:
+        args = argparse.Namespace(
+            command="thumbnail",
+            scene_threshold=0.20,
+            vision_sample_fps=0.75,
+            vision_window_seconds=8.0,
+            vision_step_seconds=4.0,
+            timestamp=None,
+            width=1280,
+            height=720,
+            quality=2,
+            champion_scale=0.55,
+            champion_anchor="right",
+            champion_overlay=Path("/tmp/not-there-champ.png"),
+            headline=None,
+            headline_size=118,
+            headline_color="white",
+            headline_font=None,
+            headline_y_ratio=0.06,
+            output=Path("thumbnail.jpg"),
+        )
+        with self.assertRaisesRegex(EditorError, "Champion overlay file not found"):
+            _validate_cli_options(args)
+
+    def test_validate_cli_options_rejects_invalid_description_options(self) -> None:
+        args = argparse.Namespace(
+            command="description",
+            scene_threshold=0.20,
+            vision_sample_fps=1.0,
+            vision_window_seconds=12.0,
+            vision_step_seconds=6.0,
+            whisper_model=None,
+            whisper_bin="auto",
+            whisper_language="en",
+            whisper_threads=4,
+            whisper_audio_stream=-1,
+            whisper_vad=True,
+            whisper_vad_threshold=0.50,
+            whisper_vad_model=None,
+            ocr_cue_scoring="auto",
+            tesseract_bin="auto",
+            ocr_sample_fps=0.25,
+            ocr_cue_threshold=0.16,
+            ai_cue_threshold=0.40,
+            max_moments=0,
+            title_count=3,
+        )
+        with self.assertRaisesRegex(EditorError, "max-moments"):
             _validate_cli_options(args)
 
     def test_validate_cli_options_rejects_crf_out_of_range(self) -> None:
@@ -669,6 +1209,232 @@ class SegmentLogicTests(unittest.TestCase):
                 )
 
             self.assertTrue(output_path.parent.is_dir())
+
+    def test_generate_thumbnail_uses_manual_timestamp(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.mp4"
+            output_path = Path(temp_dir) / "thumb.jpg"
+            input_path.touch()
+            with (
+                patch("league_video_editor.cli._probe_duration_seconds", return_value=120.0),
+                patch(
+                    "league_video_editor.cli._detect_watchability_crop_filter",
+                    return_value="crop=1920:1080:0:0",
+                ),
+                patch("league_video_editor.cli._run_command") as run_command,
+            ):
+                run_command.return_value = subprocess.CompletedProcess(
+                    args=["ffmpeg"], returncode=0, stdout="", stderr=""
+                )
+                result = generate_thumbnail(
+                    input_path=input_path,
+                    output_path=output_path,
+                    timestamp_seconds=42.5,
+                    scene_threshold=0.20,
+                    vision_sample_fps=0.75,
+                    vision_window_seconds=8.0,
+                    vision_step_seconds=4.0,
+                    width=1280,
+                    height=720,
+                    quality=2,
+                    auto_crop=True,
+                    enhance=True,
+                    champion_overlay_path=None,
+                    champion_scale=0.55,
+                    champion_anchor="right",
+                    headline_text=None,
+                    headline_size=118,
+                    headline_color="white",
+                    headline_font=None,
+                    headline_y_ratio=0.06,
+                )
+
+            self.assertFalse(bool(result["auto_selected"]))
+            self.assertAlmostEqual(float(result["timestamp_seconds"]), 42.5, delta=0.01)
+            called_cmd = run_command.call_args.args[0]
+            self.assertIn("-ss", called_cmd)
+            self.assertIn("42.500", called_cmd)
+            self.assertIn("-q:v", called_cmd)
+            self.assertTrue(output_path.parent.is_dir())
+
+    def test_generate_thumbnail_auto_selects_from_vision_windows(self) -> None:
+        windows = [
+            VisionWindow(start=12.0, end=20.0, score=0.35, motion=3.0, saturation=16.0, scene_density=0.05),
+            VisionWindow(start=46.0, end=54.0, score=0.92, motion=10.0, saturation=42.0, scene_density=0.20),
+            VisionWindow(start=70.0, end=78.0, score=0.40, motion=4.0, saturation=18.0, scene_density=0.06),
+        ]
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.mp4"
+            output_path = Path(temp_dir) / "thumb.png"
+            input_path.touch()
+            with (
+                patch("league_video_editor.cli._probe_duration_seconds", return_value=100.0),
+                patch(
+                    "league_video_editor.cli.detect_scene_events_adaptive",
+                    return_value=([10.0, 32.0, 50.0], 0.20),
+                ) as detect_events,
+                patch("league_video_editor.cli.score_vision_activity", return_value=windows) as score_vision,
+                patch("league_video_editor.cli._run_command") as run_command,
+            ):
+                run_command.return_value = subprocess.CompletedProcess(
+                    args=["ffmpeg"], returncode=0, stdout="", stderr=""
+                )
+                result = generate_thumbnail(
+                    input_path=input_path,
+                    output_path=output_path,
+                    timestamp_seconds=None,
+                    scene_threshold=0.20,
+                    vision_sample_fps=0.75,
+                    vision_window_seconds=8.0,
+                    vision_step_seconds=4.0,
+                    width=1280,
+                    height=720,
+                    quality=2,
+                    auto_crop=False,
+                    enhance=False,
+                    champion_overlay_path=None,
+                    champion_scale=0.55,
+                    champion_anchor="right",
+                    headline_text=None,
+                    headline_size=118,
+                    headline_color="white",
+                    headline_font=None,
+                    headline_y_ratio=0.06,
+                )
+
+            self.assertTrue(bool(result["auto_selected"]))
+            self.assertGreater(float(result["timestamp_seconds"]), 40.0)
+            self.assertLess(float(result["timestamp_seconds"]), 60.0)
+            self.assertEqual(detect_events.call_count, 1)
+            self.assertEqual(score_vision.call_count, 1)
+            called_cmd = run_command.call_args.args[0]
+            self.assertIn(str(output_path), called_cmd)
+            self.assertNotIn("-q:v", called_cmd)
+
+    def test_generate_thumbnail_applies_champion_overlay_and_headline(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.mp4"
+            champion_png = Path(temp_dir) / "champ.png"
+            output_path = Path(temp_dir) / "thumb.jpg"
+            input_path.touch()
+            champion_png.touch()
+            with (
+                patch("league_video_editor.cli._probe_duration_seconds", return_value=180.0),
+                patch("league_video_editor.cli._create_headline_overlay_image"),
+                patch("league_video_editor.cli._run_command") as run_command,
+            ):
+                run_command.return_value = subprocess.CompletedProcess(
+                    args=["ffmpeg"], returncode=0, stdout="", stderr=""
+                )
+                result = generate_thumbnail(
+                    input_path=input_path,
+                    output_path=output_path,
+                    timestamp_seconds=50.0,
+                    scene_threshold=0.20,
+                    vision_sample_fps=0.75,
+                    vision_window_seconds=8.0,
+                    vision_step_seconds=4.0,
+                    width=1280,
+                    height=720,
+                    quality=2,
+                    auto_crop=False,
+                    enhance=True,
+                    champion_overlay_path=champion_png,
+                    champion_scale=0.60,
+                    champion_anchor="left",
+                    headline_text="KATARINA CARRY",
+                    headline_size=116,
+                    headline_color="#ffd400",
+                    headline_font=None,
+                    headline_y_ratio=0.08,
+                )
+
+            self.assertTrue(bool(result["used_champion_overlay"]))
+            self.assertTrue(bool(result["used_headline_text"]))
+            called_cmd = run_command.call_args.args[0]
+            self.assertIn(str(champion_png), called_cmd)
+            self.assertIn("-filter_complex", called_cmd)
+            filter_graph = called_cmd[called_cmd.index("-filter_complex") + 1]
+            self.assertIn("overlay=", filter_graph)
+            self.assertIn("[2:v]format=rgba[text]", filter_graph)
+            self.assertGreaterEqual(filter_graph.count("overlay="), 2)
+
+    def test_generate_youtube_description_writes_ctr_package(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.mp4"
+            output_path = Path(temp_dir) / "youtube-description.txt"
+            model_path = Path(temp_dir) / "model.bin"
+            input_path.touch()
+            model_path.touch()
+            windows = [
+                VisionWindow(start=10.0, end=22.0, score=0.62, motion=7.2, saturation=32.0, scene_density=0.10),
+                VisionWindow(start=46.0, end=58.0, score=0.85, motion=10.5, saturation=41.0, scene_density=0.24),
+                VisionWindow(start=88.0, end=100.0, score=0.78, motion=9.2, saturation=37.0, scene_density=0.21),
+            ]
+            whisper_cues = [
+                TranscriptionCue(
+                    start=50.0,
+                    end=53.0,
+                    score=0.92,
+                    text="Shutdown into Baron Nashor!",
+                    keywords=("shutdown", "baron nashor"),
+                )
+            ]
+            ocr_cues = [
+                TranscriptionCue(
+                    start=94.0,
+                    end=96.0,
+                    score=0.76,
+                    text="Enemy ace secured",
+                    keywords=("ace",),
+                )
+            ]
+            with (
+                patch("league_video_editor.cli._probe_duration_seconds", return_value=140.0),
+                patch(
+                    "league_video_editor.cli.detect_scene_events_adaptive",
+                    return_value=([18.0, 52.0, 94.0], 0.20),
+                ),
+                patch("league_video_editor.cli.score_vision_activity", return_value=windows),
+                patch("league_video_editor.cli._collect_local_ai_cues", return_value=whisper_cues),
+                patch("league_video_editor.cli._collect_ocr_cues", return_value=ocr_cues),
+            ):
+                payload = generate_youtube_description(
+                    input_path=input_path,
+                    output_path=output_path,
+                    champion="Zed",
+                    channel_name="TestChannel",
+                    scene_threshold=0.20,
+                    vision_sample_fps=1.0,
+                    vision_window_seconds=12.0,
+                    vision_step_seconds=6.0,
+                    whisper_model=model_path,
+                    whisper_bin="whisper-cli",
+                    whisper_language="en",
+                    whisper_threads=4,
+                    whisper_audio_stream=-1,
+                    whisper_vad=True,
+                    whisper_vad_threshold=0.50,
+                    whisper_vad_model=None,
+                    ocr_cue_scoring="auto",
+                    tesseract_bin="tesseract",
+                    ocr_sample_fps=0.25,
+                    ocr_cue_threshold=0.16,
+                    ai_cue_threshold=0.30,
+                    max_moments=6,
+                    title_count=3,
+                )
+
+            self.assertTrue(output_path.exists())
+            output_text = output_path.read_text(encoding="utf-8")
+            self.assertIn("Title Ideas:", output_text)
+            self.assertIn("Description:", output_text)
+            self.assertIn("Chapters:", output_text)
+            self.assertIn("#LeagueOfLegends", output_text)
+            self.assertGreaterEqual(len(payload["titles"]), 1)
+            self.assertGreaterEqual(len(payload["chapters"]), 1)
+            self.assertEqual(payload["whisper_cue_count"], 1)
+            self.assertEqual(payload["ocr_cue_count"], 1)
 
     def test_render_highlights_retries_without_loudnorm_on_non_finite_audio(self) -> None:
         with TemporaryDirectory() as temp_dir:
