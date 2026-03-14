@@ -1,0 +1,90 @@
+{
+  "input_path": "/path/to/obs-recording.mp4",
+  "output_dir": ".loleditor/projects/example/output",
+  "champion": {
+    "champion_name": "Zed",
+    "champion_png": "/path/to/zed.png",
+    "lane": "mid",
+    "role": "assassin",
+    "player_name": "YourSummoner",
+    "rank": "diamond",
+    "patch": "14.10",
+    "kills": 14,
+    "deaths": 3,
+    "assists": 9
+  },
+  "detection": {
+    "scene_threshold": 0.35,
+    "scene_weight": 0.15,
+    "killfeed_enabled": true,
+    "killfeed_weight": 0.25,
+    "killfeed_region": "auto",
+    "combat_intensity_enabled": true,
+    "combat_intensity_weight": 0.2,
+    "objective_detection_enabled": true,
+    "objective_weight": 0.15,
+    "scoreboard_detection_enabled": true,
+    "scoreboard_weight": 0.1,
+    "whisper_enabled": true,
+    "whisper_weight": 0.1,
+    "audio_excitement_enabled": true,
+    "audio_excitement_weight": 0.15,
+    "multi_kill_bonus": 0.3,
+    "pentakill_bonus": 0.5
+  },
+  "editing": {
+    "pre_fight_context_seconds": 6.0,
+    "post_fight_aftermath_seconds": 4.0,
+    "min_clip_seconds": 8.0,
+    "max_clip_seconds": 42.0,
+    "dynamic_length_enabled": true,
+    "smoothing_enabled": true,
+    "min_gap_between_clips": 2.5,
+    "retain_death_context": true,
+    "death_context_before": 8.0,
+    "death_context_after": 3.0,
+    "target_duration_seconds": 540.0,
+    "max_clips": 24
+  },
+  "overlays": {
+    "enable_intro": true,
+    "enable_outro": true,
+    "enable_kda_overlay": true,
+    "enable_champion_portrait": true,
+    "enable_transitions": true,
+    "enable_subscribe_animation": false,
+    "intro_duration_seconds": 4.0,
+    "outro_duration_seconds": 6.0,
+    "transition_style": "crossfade",
+    "transition_duration_seconds": 0.8,
+    "kda_position": "top-right",
+    "portrait_position": "bottom-left",
+    "font_family": "auto"
+  },
+  "output": {
+    "format": "youtube",
+    "resolution": "1080p",
+    "framerate": 60,
+    "codec": "auto",
+    "crf": 20,
+    "preset": "fast",
+    "profile": "balanced"
+  },
+  "content": {
+    "title": "",
+    "description": "",
+    "tags": ["leagueoflegends", "zed", "ranked highlights"],
+    "thumbnail_headline": "",
+    "auto_generate_title": true,
+    "auto_generate_description": true,
+    "auto_generate_tags": true,
+    "auto_generate_chapters": true
+  },
+  "upload": {
+    "auto_upload": false,
+    "privacy": "private",
+    "category_id": "20",
+    "channel_name": "YourChannel",
+    "default_tags": ["leagueoflegends", "lolhighlights", "gaming"]
+  }
+}

@@ -1,0 +1,48 @@
+<svg width="1440" height="900" viewBox="0 0 1440 900" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1440" height="900" fill="#04080F"/>
+  <rect x="28" y="28" width="1384" height="72" rx="26" fill="#0A1428" stroke="#1E2328"/>
+  <text x="64" y="69" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="26" font-weight="700">LoLEditor Creator Suite</text>
+  <text x="64" y="92" fill="#6B7280" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="12" letter-spacing="3">DESKTOP STUDIO</text>
+
+  <rect x="28" y="124" width="894" height="748" rx="30" fill="#091428" stroke="#C89B3C" stroke-opacity="0.18"/>
+  <rect x="960" y="124" width="452" height="358" rx="30" fill="#091428" stroke="#0AC8B9" stroke-opacity="0.20"/>
+  <rect x="960" y="514" width="452" height="358" rx="30" fill="#120F08" stroke="#C89B3C" stroke-opacity="0.20"/>
+
+  <text x="72" y="188" fill="#0AC8B9" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="12" letter-spacing="4">CREATOR SETUP</text>
+  <text x="72" y="232" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="42" font-weight="700">Build a branded</text>
+  <text x="72" y="282" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="42" font-weight="700">League highlight package</text>
+  <text x="72" y="332" fill="#94A3B8" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18">Champion metadata, KDA, YouTube copy, overlays, and thumbnail headline</text>
+
+  <rect x="72" y="382" width="378" height="182" rx="24" fill="#0B1018" stroke="#1E2328"/>
+  <rect x="470" y="382" width="378" height="182" rx="24" fill="#0B1018" stroke="#1E2328"/>
+  <rect x="72" y="590" width="776" height="226" rx="24" fill="#06090F" stroke="#1E2328"/>
+
+  <text x="96" y="420" fill="#C89B3C" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="12" letter-spacing="3">CHAMPION CONTEXT</text>
+  <text x="96" y="455" fill="#F8FAFC" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="26" font-weight="700">Zed • Mid • Diamond</text>
+  <text x="96" y="488" fill="#94A3B8" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="16">Portrait, patch, player name, role, lane, and optional KDA.</text>
+
+  <text x="494" y="420" fill="#C89B3C" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="12" letter-spacing="3">PUBLISHING METADATA</text>
+  <text x="494" y="455" fill="#F8FAFC" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="26" font-weight="700">Title, tags, and chapters</text>
+  <text x="494" y="488" fill="#94A3B8" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="16">Auto-generated from weighted highlight scoring and smart clip planning.</text>
+
+  <text x="96" y="628" fill="#C89B3C" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="12" letter-spacing="3">PIPELINE PROMISE</text>
+  <text x="96" y="668" fill="#F8FAFC" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="22" font-weight="700">Scene detection, OCR, transcript, scoreboard, audio, and smart editing</text>
+  <text x="96" y="706" fill="#94A3B8" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="16">One click builds a ranked timeline, branded overlay assets, thumbnail, title ideas, description draft, and final YouTube-ready montage.</text>
+
+  <text x="992" y="178" fill="#0AC8B9" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="12" letter-spacing="3">PIPELINE PREVIEW</text>
+  <rect x="992" y="210" width="388" height="66" rx="18" fill="#0B1018"/>
+  <rect x="992" y="294" width="388" height="66" rx="18" fill="#0B1018"/>
+  <rect x="992" y="378" width="388" height="66" rx="18" fill="#0B1018"/>
+  <text x="1018" y="251" fill="#F8FAFC" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18">Weighted multi-signal highlight scoring</text>
+  <text x="1018" y="335" fill="#F8FAFC" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18">Smart edit planning with context windows</text>
+  <text x="1018" y="419" fill="#F8FAFC" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18">Auto title, description, tags, and overlays</text>
+
+  <text x="992" y="568" fill="#C89B3C" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="12" letter-spacing="3">BRANDING SNAPSHOT</text>
+  <rect x="992" y="600" width="388" height="230" rx="22" fill="#0B1018"/>
+  <circle cx="1060" cy="680" r="42" fill="#C89B3C" fill-opacity="0.15" stroke="#C89B3C" stroke-opacity="0.35"/>
+  <text x="1045" y="690" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="28" font-weight="700">Z</text>
+  <text x="1128" y="662" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="28" font-weight="700">Zed Creator Cut</text>
+  <text x="1128" y="694" fill="#94A3B8" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="16">Diamond • Mid • Patch 14.10</text>
+  <rect x="1020" y="730" width="332" height="54" rx="18" fill="#120F08" stroke="#C89B3C" stroke-opacity="0.20"/>
+  <text x="1042" y="764" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18" font-weight="700">Thumbnail headline auto-generated</text>
+</svg>

@@ -1,0 +1,104 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-lol-dark text-white font-display;
+    background-image:
+      radial-gradient(circle at top left, rgba(244, 211, 94, 0.08), transparent 25%),
+      radial-gradient(circle at top right, rgba(10, 200, 185, 0.08), transparent 25%),
+      linear-gradient(180deg, #08111f 0%, #050912 45%, #02050b 100%);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  ::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: rgba(1, 10, 19, 0.72);
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(30, 35, 40, 0.88);
+    border-radius: 999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(10, 200, 185, 0.4);
+  }
+}
+
+@layer components {
+  .bg-app-shell {
+    background:
+      radial-gradient(circle at top left, rgba(244, 211, 94, 0.08), transparent 25%),
+      radial-gradient(circle at bottom right, rgba(10, 200, 185, 0.08), transparent 25%),
+      linear-gradient(180deg, #08111f 0%, #050912 45%, #02050b 100%);
+  }
+
+  .btn-primary {
+    @apply rounded-2xl bg-lol-gold px-4 py-2 font-semibold text-lol-dark transition-all duration-200;
+    box-shadow: 0 16px 34px rgba(244, 211, 94, 0.18);
+  }
+
+  .btn-primary:hover {
+    @apply bg-lol-gold-light;
+    transform: translateY(-1px);
+  }
+
+  .btn-primary:disabled {
+    @apply cursor-not-allowed opacity-50;
+    transform: none;
+  }
+
+  .btn-secondary {
+    @apply rounded-2xl border border-lol-gold/20 bg-black/20 px-4 py-2 text-lol-gold-light transition-all duration-200;
+  }
+
+  .btn-secondary:hover {
+    @apply border-lol-gold/40 bg-white/[0.04];
+  }
+
+  .btn-danger {
+    @apply rounded-2xl border border-lol-red/25 bg-lol-red/10 px-4 py-2 text-lol-red transition-all duration-200;
+  }
+
+  .btn-danger:hover {
+    @apply bg-lol-red/20;
+  }
+
+  .input-field {
+    @apply w-full rounded-2xl border border-white/[0.08] bg-black/20 px-4 py-3 text-white placeholder-gray-500 outline-none transition-all duration-200;
+  }
+
+  .input-field:focus {
+    @apply border-lol-blue/40 bg-white/[0.03];
+    box-shadow: 0 0 0 1px rgba(10, 200, 185, 0.18);
+  }
+}
+
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+
+.titlebar-nodrag {
+  -webkit-app-region: no-drag;
+}

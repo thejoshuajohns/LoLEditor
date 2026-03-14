@@ -1,0 +1,46 @@
+<svg width="1440" height="900" viewBox="0 0 1440 900" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1440" height="900" fill="#04080F"/>
+  <rect x="28" y="28" width="1384" height="844" rx="30" fill="#091428" stroke="#1E2328"/>
+  <text x="70" y="86" fill="#0AC8B9" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="12" letter-spacing="4">TIMELINE EDITOR</text>
+  <text x="70" y="132" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="36" font-weight="700">Refine the final montage before render</text>
+
+  <rect x="70" y="176" width="1300" height="170" rx="26" fill="#060A12" stroke="#1E2328"/>
+  <rect x="112" y="236" width="1180" height="54" rx="22" fill="#0B1018"/>
+  <rect x="150" y="226" width="188" height="74" rx="20" fill="#C89B3C" fill-opacity="0.20" stroke="#C89B3C" stroke-opacity="0.35"/>
+  <rect x="386" y="226" width="164" height="74" rx="20" fill="#C89B3C" fill-opacity="0.14" stroke="#C89B3C" stroke-opacity="0.20"/>
+  <rect x="612" y="226" width="222" height="74" rx="20" fill="#C89B3C" fill-opacity="0.14" stroke="#C89B3C" stroke-opacity="0.20"/>
+  <rect x="936" y="226" width="146" height="74" rx="20" fill="#C89B3C" fill-opacity="0.14" stroke="#C89B3C" stroke-opacity="0.20"/>
+  <text x="178" y="270" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="16" font-weight="700">Burst Combo</text>
+  <text x="402" y="270" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="16" font-weight="700">Tower Dive</text>
+  <text x="646" y="270" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="16" font-weight="700">Baron Swing</text>
+  <text x="968" y="270" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="16" font-weight="700">Ace Closeout</text>
+
+  <rect x="70" y="382" width="346" height="438" rx="26" fill="#060A12" stroke="#1E2328"/>
+  <rect x="446" y="382" width="498" height="438" rx="26" fill="#060A12" stroke="#1E2328"/>
+  <rect x="974" y="382" width="396" height="438" rx="26" fill="#060A12" stroke="#1E2328"/>
+
+  <text x="98" y="420" fill="#94A3B8" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="12" letter-spacing="3">CLIPS</text>
+  <rect x="98" y="448" width="290" height="74" rx="20" fill="#C89B3C" fill-opacity="0.12" stroke="#C89B3C" stroke-opacity="0.35"/>
+  <rect x="98" y="536" width="290" height="74" rx="20" fill="#0B1018" stroke="#1E2328"/>
+  <rect x="98" y="624" width="290" height="74" rx="20" fill="#0B1018" stroke="#1E2328"/>
+  <text x="124" y="484" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18" font-weight="700">Burst Combo</text>
+  <text x="124" y="572" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18" font-weight="700">Dragon Fight</text>
+  <text x="124" y="660" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18" font-weight="700">Baron Swing</text>
+
+  <text x="474" y="420" fill="#94A3B8" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="12" letter-spacing="3">SELECTED CLIP</text>
+  <text x="474" y="464" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="30" font-weight="700">Burst Combo</text>
+  <rect x="474" y="502" width="440" height="100" rx="20" fill="#0B1018"/>
+  <rect x="474" y="624" width="440" height="76" rx="20" fill="#0B1018"/>
+  <rect x="474" y="718" width="440" height="76" rx="20" fill="#0B1018"/>
+  <text x="502" y="544" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18" font-weight="700">Score 92% • Start 11:38 • End 12:03</text>
+  <text x="502" y="670" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18" font-weight="700">Boundary controls</text>
+  <text x="502" y="764" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18" font-weight="700">Narrative order controls</text>
+
+  <text x="1002" y="420" fill="#94A3B8" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="12" letter-spacing="3">GENERATED METADATA</text>
+  <rect x="1002" y="450" width="340" height="110" rx="20" fill="#0B1018"/>
+  <rect x="1002" y="580" width="340" height="110" rx="20" fill="#0B1018"/>
+  <rect x="1002" y="710" width="340" height="82" rx="20" fill="#0B1018"/>
+  <text x="1028" y="488" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18" font-weight="700">Zed Highlights | Carry Game</text>
+  <text x="1028" y="618" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18" font-weight="700">leagueoflegends • zed • ranked</text>
+  <text x="1028" y="748" fill="#F0E6D2" font-family="Avenir Next, Trebuchet MS, sans-serif" font-size="18" font-weight="700">intro card • portrait • end card</text>
+</svg>
