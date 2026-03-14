@@ -1,138 +1,166 @@
-# League Video Editor
+# LoLEditor
 
-Create YouTube-ready videos from your League of Legends OBS recordings.
+AI-powered League of Legends highlight generation for creators.
 
-## What this does
+LoLEditor now combines:
 
-- Detects high-action moments using scene-change + vision scoring.
-- Optionally adds local AI transcript cues (Whisper.cpp) to prioritize real callouts:
-  - kills, shutdowns, aces, objectives, nexus/end calls
-- Builds a highlight plan (`edit-plan.json`) that you can inspect/edit.
-- Anchors highlights to include:
-  - detected in-game spawn/start (skips client/loading when detected)
-  - end of the match (nexus finish coverage)
-- Uses a balanced target runtime by default (about 20 minutes) with fewer, longer cuts.
-- Prioritizes kill/assist/death context:
-  - detects high-intensity combat windows and keeps lead-in/setup
-  - detects gray-screen death transitions and keeps lead-in context
-- Renders a highlight montage (`highlights.mp4`) with:
-  - 1080p output
-  - 60 FPS
-  - H.264 video + AAC audio
-  - audio loudness normalization for YouTube
-- Can also export the full match in YouTube-ready format.
+- weighted highlight detection across scene changes, OCR cues, transcript callouts, objective moments, scoreboard swings, combat intensity, and audio spikes
+- smart clip planning with pre-fight context, post-fight aftermath, dynamic clip length, and narrative-friendly timeline editing
+- champion-aware branding with intro cards, end cards, champion portraits, optional KDA overlays, and thumbnail headlines
+- auto-generated YouTube metadata including title ideas, description draft, tags, and chapter markers
+- an Electron + React desktop UI backed by a Python/FastAPI processing service
 
-## Requirements
+## Screenshots
 
-- Python 3.11+
-- `ffmpeg` and `ffprobe` available on your `PATH`
-- `Pillow` (installed automatically with this package)
-- Optional for local AI mode: `whisper.cpp` (`whisper-cli`) + a local Whisper model file
+Desktop setup flow:
 
-On macOS with Homebrew:
+![Desktop overview](docs/screenshots/desktop-overview.svg)
 
-```bash
-brew install ffmpeg
-```
+Timeline editor:
 
-## Install
+![Timeline editor](docs/screenshots/timeline-editor.svg)
 
-From this project folder:
+## What It Does
 
-```bash
-python3 -m pip install -e .
-```
+LoLEditor takes an OBS recording and turns it into a creator-ready highlight package:
 
-This gives you the command:
+1. Imports the recording into a persistent project workspace.
+2. Detects highlight candidates using multiple signals.
+3. Ranks moments by weighted importance.
+4. Builds a smart edit plan with context-aware clip windows.
+5. Generates title candidates, description text, tags, and chapters.
+6. Prepares overlay assets.
+7. Renders a YouTube-ready highlight montage and thumbnail.
+8. Optionally uploads the result to YouTube.
 
-```bash
-lol-video-editor
-```
+## Chosen Desktop Architecture
 
-## Quick Start
+This repository uses:
 
-Use `auto` first:
+- Python backend for analysis, ffmpeg orchestration, rendering, metadata generation, and upload
+- FastAPI for the desktop API layer
+- Electron + React for the desktop UI
 
-```bash
-lol-video-editor auto /path/to/your-obs-recording.mp4 \
-  --output highlights.mp4 \
-  --plan edit-plan.json
-```
+Why this stack:
 
-Use local AI scoring (fully local/offline):
+- the heavy work is already Python- and ffmpeg-centric
+- React is a better fit for a timeline-driven editor than Qt for this project
+- Electron lets the app keep native file dialogs and drag-and-drop while preserving web UI iteration speed
+- it avoids adding Rust/Tauri complexity while the product surface is still evolving quickly
 
-```bash
-lol-video-editor auto /path/to/your-obs-recording.mp4 \
-  --output highlights.mp4 \
-  --plan edit-plan.json \
-  --vision-scoring local-ai \
-  --whisper-model /path/to/ggml-base.en.bin \
-  --whisper-bin whisper-cli \
-  --whisper-language en
-```
+## Current Architecture
 
-Then upload `highlights.mp4` to YouTube.
+Core product layers:
 
-## Commands
+- [`src/league_video_editor/application`](src/league_video_editor/application)
+  Application services for persistent projects, analysis orchestration, metadata generation, overlay preparation, and render packaging.
+- [`src/league_video_editor/core`](src/league_video_editor/core)
+  Multi-signal highlight detection, audio analysis, smart editing, and parallel processing helpers.
+- [`src/league_video_editor/rendering`](src/league_video_editor/rendering)
+  Overlay asset generation and transition helpers.
+- [`src/league_video_editor/server`](src/league_video_editor/server)
+  FastAPI backend for the desktop app.
+- [`ui`](ui)
+  Electron shell and React desktop frontend.
+- [`config/example-project.json`](config/example-project.json)
+  Example project configuration for branding, detection, editing, and publishing.
 
-### 1) Analyze (build edit plan only)
+Legacy but still supported layers:
 
-```bash
-lol-video-editor analyze /path/to/recording.mp4 \
-  --plan edit-plan.json
-```
+- CLI entrypoint in [`src/league_video_editor/cli.py`](src/league_video_editor/cli.py)
+- legacy analysis/rendering primitives in [`src/league_video_editor/analyze.py`](src/league_video_editor/analyze.py), [`src/league_video_editor/render.py`](src/league_video_editor/render.py), and [`src/league_video_editor/ffmpeg_utils.py`](src/league_video_editor/ffmpeg_utils.py)
 
-Tune detection:
+## Detection Model
 
-```bash
-lol-video-editor analyze /path/to/recording.mp4 \
-  --scene-threshold 0.30 \
-  --clip-before 10 \
-  --clip-after 14 \
-  --min-gap-seconds 20 \
-  --max-clips 24 \
-  --target-duration-ratio 0.66 \
-  --target-duration-seconds 0 \
-  --intro-seconds 120 \
-  --outro-seconds 60
-```
+The desktop product pipeline now scores highlights across:
 
-Notes:
-- Lower `--scene-threshold` = more moments detected.
-- Higher `--min-gap-seconds` = fewer clips, less spam.
-- `--vision-scoring heuristic` (default) uses frame-motion + color heuristics to keep lane context while emphasizing combat/death moments.
-- `--vision-scoring local-ai` combines the existing vision scoring with local Whisper.cpp transcript cue detection.
-- `--whisper-model` is required in `local-ai` mode.
-- `--whisper-audio-stream` lets you select OBS audio stream index for AI transcription (`-1` auto/default, `0` first audio stream).
-- `--whisper-vad` / `--whisper-vad-threshold` tune speech segmentation for local transcription.
-- `--ocr-cue-scoring auto` adds optional local OCR cue detection (requires `tesseract`) for HUD text like slain/objectives.
-- `--ai-cue-threshold` controls how aggressive transcript cue selection is (lower = more AI cues).
-- `--end-on-result` (default on) trims highlights to the detected `Victory/Defeat` end so post-game downtime is excluded.
-- `--one-shot-smart` (default on) does single-pass adaptive tuning for better kill context + pacing without multi-candidate optimization.
-- By default, highlights target ~2/3 of the source match duration (`--target-duration-ratio 0.6667`).
-- Set `--target-duration-seconds` to a positive value to force an absolute target.
-- Set both `--target-duration-seconds 0` and `--target-duration-ratio 0` for an uncapped target.
+- scene changes
+- kill-feed style OCR cues
+- combat intensity from motion + saturation
+- objective cues like dragon, baron, towers, inhibitor, nexus
+- scoreboard swings from OCR/transcript score patterns
+- Whisper transcript callouts
+- audio excitement spikes
 
-## Local AI setup (Whisper.cpp)
+These signals are combined with configurable weights and then passed into the smart editor.
 
-1. Install whisper.cpp (must provide `whisper-cli` on `PATH`).
-2. Download a Whisper model (for example `base.en`).
-3. Optional: install `tesseract` for OCR HUD cue extraction (`brew install tesseract` on macOS).
-4. Run `analyze` or `auto` with:
-   - `--vision-scoring local-ai`
-   - `--whisper-model /path/to/model`
-   - optional stream selection for OBS multi-track captures: `--whisper-audio-stream 0` (or `1`, `2`, etc.)
-   - optional tuning: `--whisper-threads`, `--whisper-vad`, `--ai-cue-threshold`, `--ocr-cue-scoring auto`
+## Smart Editing
 
-### 2) Render (from existing plan)
+The edit planner supports:
+
+- pre-fight context windows
+- post-fight aftermath
+- dynamic clip length by intensity
+- death context retention
+- clip merging and smoothing
+- manual timeline deletion, extension, and reordering in the desktop UI
+
+## Publishing Automation
+
+The desktop pipeline generates:
+
+- title candidates
+- description draft
+- tag list
+- chapter markers
+- thumbnail headline
+- intro card
+- end card
+- champion portrait manifest
+- optional KDA overlay asset
+
+## Installation
+
+### Python
 
 ```bash
-lol-video-editor render /path/to/recording.mp4 \
-  --plan edit-plan.json \
-  --output highlights.mp4
+python3 -m pip install -e ".[ui,upload,dev]"
 ```
 
-### 3) Auto (analyze + render)
+Required local tools:
+
+- `ffmpeg`
+- `ffprobe`
+- `Pillow` is installed through Python dependencies
+
+Optional local tools:
+
+- `whisper.cpp` / `whisper-cli` for transcript enrichment
+- `tesseract` for OCR cue extraction
+
+macOS example:
+
+```bash
+brew install ffmpeg tesseract
+```
+
+### UI
+
+```bash
+cd ui
+npm install
+```
+
+## Running The Desktop App
+
+Start the backend only:
+
+```bash
+lol-video-editor serve
+```
+
+Run the React + Electron UI in development:
+
+```bash
+cd ui
+npm run electron:dev
+```
+
+The Electron shell will launch the Python API automatically in development.
+
+## Running The CLI
+
+Legacy CLI commands still work:
 
 ```bash
 lol-video-editor auto /path/to/recording.mp4 \
@@ -140,128 +168,109 @@ lol-video-editor auto /path/to/recording.mp4 \
   --plan edit-plan.json
 ```
 
-Optimize automatically for the best blended YouTube score:
+Useful CLI helpers:
+
+- `lol-video-editor analyze`
+- `lol-video-editor render`
+- `lol-video-editor thumbnail`
+- `lol-video-editor description`
+- `lol-video-editor upload`
+- `lol-video-editor serve`
+
+## Example Project Config
+
+Use the example project config as a baseline:
+
+- [`config/example-project.json`](config/example-project.json)
+
+It includes:
+
+- champion metadata
+- optional KDA
+- signal weight tuning
+- editing defaults
+- overlay settings
+- output profile
+- generated content defaults
+- upload defaults
+
+## Updated Repository Shape
+
+```text
+LoLEditor/
+├── config/
+│   └── example-project.json
+├── docs/
+│   └── screenshots/
+├── src/league_video_editor/
+│   ├── application/
+│   │   ├── analysis.py
+│   │   ├── content.py
+│   │   ├── overlays.py
+│   │   ├── production.py
+│   │   └── project_store.py
+│   ├── config/
+│   ├── core/
+│   ├── rendering/
+│   ├── server/
+│   └── upload.py
+└── ui/
+    ├── electron/
+    └── src/
+```
+
+## Performance Notes
+
+Current improvements:
+
+- parallel transcript/OCR/audio enrichment
+- hardware-aware encoder selection
+- persistent desktop project workspaces
+- reusable overlay assets
+- modular render packaging
+
+Good next optimizations:
+
+- promote the CLI cache store into the desktop server pipeline
+- chunked parallel frame analysis for long games
+- GPU-assisted OCR/transcript preprocessing where available
+- render artifact reuse for metadata-only revisions
+
+## Future Roadmap
+
+High-priority next steps:
+
+- batch processing for multiple matches
+- Shorts / TikTok / vertical export presets
+- Twitch clip packaging
+- Discord auto-posting hooks
+- durable job queues instead of in-process tasks
+- richer overlay compositing directly inside the main ffmpeg graph
+- stronger region-aware OCR for scoreboard and kill feed
+- project templates for recurring creator branding
+
+## Development Notes
+
+The legacy CLI test suite still passes:
 
 ```bash
-lol-video-editor auto /path/to/recording.mp4 \
-  --output highlights.mp4 \
-  --plan edit-plan.json \
-  --auto-optimize \
-  --optimize-candidates 6 \
-  --optimize-metric youtube
+python3 -m pytest -q
 ```
 
-`--auto-optimize` is slower (multiple candidate renders). If you want one-and-done speed, keep it off and rely on default `--one-shot-smart`.
-
-### 4) Full match export (no auto clipping)
+Python syntax smoke-check:
 
 ```bash
-lol-video-editor full /path/to/recording.mp4 \
-  --output full-match-youtube.mp4
+python3 -m compileall -q src
 ```
 
-### 5) Thumbnail generation
+## What Changed In This Evolution
 
-Auto-pick a high-action frame (recommended):
+This repository started as a mostly CLI-first highlight script. It now has:
 
-```bash
-lol-video-editor thumbnail /path/to/video.mp4 \
-  --output thumbnail.jpg
-```
-
-Use a manual frame timestamp:
-
-```bash
-lol-video-editor thumbnail /path/to/video.mp4 \
-  --output thumbnail.jpg \
-  --timestamp 512.4
-```
-
-Add champion art + headline text:
-
-```bash
-lol-video-editor thumbnail /path/to/video.mp4 \
-  --output thumbnail.jpg \
-  --champion-overlay /path/to/champion-transparent.png \
-  --champion-scale 0.60 \
-  --champion-anchor right \
-  --headline "PENTA IN RANKED" \
-  --headline-size 122 \
-  --headline-color "#ffd400"
-```
-
-Useful options:
-- `--width` / `--height` set output size (default `1280x720`)
-- `--enhance` adds light color/sharpness boost (default on)
-- `--auto-crop` removes common black borders before resize (default on)
-- `--champion-overlay` overlays your transparent PNG champion art.
-- `--headline` overlays text; use `\n` in the value for multi-line headlines.
-
-### 6) YouTube description generator
-
-Generate CTR-focused title ideas + a ready-to-paste YouTube description based on detected moments:
-
-```bash
-lol-video-editor description /path/to/highlights.mp4 \
-  --output youtube-description.txt \
-  --champion Zed \
-  --channel-name "YourChannel"
-```
-
-Optional local AI cue enrichment:
-
-```bash
-lol-video-editor description /path/to/highlights.mp4 \
-  --output youtube-description.txt \
-  --champion Zed \
-  --whisper-model /path/to/ggml-small.en.bin \
-  --whisper-bin whisper-cli \
-  --ocr-cue-scoring auto
-```
-
-### 7) Watchability analysis
-
-```bash
-lol-video-editor watchability /path/to/highlights.mp4 \
-  --report watchability-report.json
-```
-
-Outputs:
-- `watchability_score` (pace/activity oriented)
-- `highlight_quality_score` (general highlight quality)
-- blended `youtube_score` (profile-aware blend of both)
-
-The report also includes an `activity_profile`, expected pace, blend weights, and improvement suggestions so low-action matches are graded more fairly.
-The watchability pass auto-retries lower scene thresholds when no events are detected and ignores padded borders during frame sampling.
-
-## Editing the plan manually
-
-After `analyze`, open `edit-plan.json` and adjust `segments`:
-
-```json
-{
-  "segments": [
-    { "start": 112.5, "end": 134.2 },
-    { "start": 540.0, "end": 565.0 }
-  ]
-}
-```
-
-Then run `render` with that plan.
-
-## Testing
-
-Run:
-
-```bash
-python3 -m unittest discover -s tests
-```
-
-## Limitations
-
-- Local AI mode depends on your local whisper.cpp/model setup and hardware speed.
-- Cue quality depends on microphone/game audio clarity and language match.
-- No GUI yet (CLI-only MVP).
-- Requires local `ffmpeg`.
-
-If you want, next step is a lightweight local web UI for timeline editing before render.
+- a persistent project model
+- a real desktop product workflow
+- a multi-signal weighted highlight engine wired into the app
+- publishing metadata generation
+- branded overlay asset generation
+- render packaging for final deliverables
+- a significantly more polished Electron + React creator UI

@@ -16,9 +16,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ui = [
+  "fastapi>=0.115.0",
+  "uvicorn>=0.32.0",
+  "pydantic>=2.9.0",
+]
 upload = [
   "google-api-python-client>=2.100.0",
   "google-auth-oauthlib>=1.1.0",
+]
+dev = [
+  "pytest>=8.0.0",
 ]
 
 [project.scripts]
