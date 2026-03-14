@@ -15,6 +15,12 @@ dependencies = [
   "Pillow>=10.0.0",
 ]
 
+[project.optional-dependencies]
+upload = [
+  "google-api-python-client>=2.100.0",
+  "google-auth-oauthlib>=1.1.0",
+]
+
 [project.scripts]
 lol-video-editor = "league_video_editor.cli:main"
 
