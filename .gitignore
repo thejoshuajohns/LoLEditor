@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Generated editor outputs / experiments
+edit-plan*.json
+watchability-report*.json
+highlights*.mp4
+test-*.mp4
+
+# OAuth credentials (never commit)
+client_secrets.json

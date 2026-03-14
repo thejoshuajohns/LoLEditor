@@ -1429,8 +1429,8 @@ class SegmentLogicTests(unittest.TestCase):
             output_text = output_path.read_text(encoding="utf-8")
             self.assertIn("Title Ideas:", output_text)
             self.assertIn("Description:", output_text)
-            self.assertIn("Chapters:", output_text)
-            self.assertIn("#LeagueOfLegends", output_text)
+            self.assertIn("\u2013", output_text)  # em-dash in timestamp lines
+            self.assertIn("#leagueoflegends", output_text)
             self.assertGreaterEqual(len(payload["titles"]), 1)
             self.assertGreaterEqual(len(payload["chapters"]), 1)
             self.assertEqual(payload["whisper_cue_count"], 1)
